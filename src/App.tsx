@@ -62,8 +62,8 @@ type AccountProfile = {
   firstName: string;
   lastName: string;
   cursorColor: string;
-  passwordHash: string;
   createdAt: string;
+  passwordHash?: string;
 };
 
 type AuthMode = "signin" | "signup";
@@ -87,6 +87,9 @@ type AccountSettingsForm = {
   lastName: string;
   email: string;
   cursorColor: string;
+  currentPassword: string;
+  newPassword: string;
+  confirmPassword: string;
 };
 
 type UpdaterStatus = {
@@ -384,6 +387,29 @@ function getAccountDisplayName(account: Pick<AccountProfile, "firstName" | "last
   return fullName || account.email;
 }
 
+function normalizeAccountProfile(data: unknown): AccountProfile | null {
+  if (!data || typeof data !== "object") {
+    return null;
+  }
+
+  const row = data as Record<string, unknown>;
+  const email = normalizeEmail(String(row.email ?? ""));
+
+  if (!email) {
+    return null;
+  }
+
+  return {
+    id: String(row.id ?? row.userId ?? row.uuid ?? email),
+    email,
+    firstName: String(row.firstName ?? row.first_name ?? row.prenom ?? ""),
+    lastName: String(row.lastName ?? row.last_name ?? row.nom ?? ""),
+    cursorColor: String(row.cursorColor ?? row.cursor_color ?? row.color ?? collabColors[0]),
+    createdAt: String(row.createdAt ?? row.created_at ?? new Date().toISOString()),
+    passwordHash: typeof row.passwordHash === "string" ? row.passwordHash : undefined,
+  };
+}
+
 function loadStoredAccounts() {
   if (typeof window === "undefined") {
     return [] as AccountProfile[];
@@ -402,48 +428,58 @@ function loadStoredAccounts() {
   }
 }
 
-function persistAccounts(accounts: AccountProfile[]) {
+function loadStoredSessionAccount() {
+  if (typeof window === "undefined") {
+    return null as AccountProfile | null;
+  }
+
+  const raw = window.localStorage.getItem(authSessionStorageKey);
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw);
+      const account = normalizeAccountProfile(parsed);
+      if (account) {
+        return account;
+      }
+    } catch {
+      const legacyEmail = normalizeEmail(raw);
+      if (legacyEmail) {
+        const legacyAccounts = loadStoredAccounts();
+        const legacyAccount = legacyAccounts.find((item) => normalizeEmail(item.email) === legacyEmail);
+        if (legacyAccount) {
+          return normalizeAccountProfile(legacyAccount);
+        }
+      }
+    }
+  }
+
+  const legacyEmail = normalizeEmail(window.localStorage.getItem(authSessionStorageKey) || "");
+  if (!legacyEmail) {
+    return null as AccountProfile | null;
+  }
+
+  const legacyAccounts = loadStoredAccounts();
+  const legacyAccount = legacyAccounts.find((item) => normalizeEmail(item.email) === legacyEmail);
+  return normalizeAccountProfile(legacyAccount);
+}
+
+function persistSessionAccount(account: AccountProfile | null) {
   if (typeof window === "undefined") {
     return;
   }
 
-  window.localStorage.setItem(authAccountsStorageKey, JSON.stringify(accounts));
-}
-
-function loadStoredSessionEmail() {
-  if (typeof window === "undefined") {
-    return "";
-  }
-
-  return normalizeEmail(window.localStorage.getItem(authSessionStorageKey) || "");
-}
-
-function persistSessionEmail(email: string) {
-  if (typeof window === "undefined") {
+  if (!account) {
+    window.localStorage.removeItem(authSessionStorageKey);
     return;
   }
 
-  const normalized = normalizeEmail(email);
+  const normalized = normalizeAccountProfile(account);
   if (!normalized) {
     window.localStorage.removeItem(authSessionStorageKey);
     return;
   }
 
-  window.localStorage.setItem(authSessionStorageKey, normalized);
-}
-
-async function hashPassword(value: string) {
-  if (typeof crypto !== "undefined" && crypto.subtle) {
-    const buffer = await crypto.subtle.digest(
-      "SHA-256",
-      new TextEncoder().encode(value)
-    );
-    return Array.from(new Uint8Array(buffer))
-      .map((item) => item.toString(16).padStart(2, "0"))
-      .join("");
-  }
-
-  return `fallback-${hashString(value)}`;
+  window.localStorage.setItem(authSessionStorageKey, JSON.stringify(normalized));
 }
 
 function persistCollabIdentity(identity: CollabIdentity) {
@@ -876,16 +912,7 @@ async function fetchTicketsFromSheets(selectedMonth: string) {
   }
 }
 
-async function createTicketInSheets(selectedMonth: string, form: NewTicketForm) {
-  const payload = {
-    action: "addTicket",
-    mois: getApiMonthName(selectedMonth),
-    date: form.date,
-    montant: form.amount,
-    description: form.description,
-    categorie: form.category,
-  };
-
+async function postSheetsAction(payload: Record<string, unknown>) {
   try {
     const response = await fetch(SHEETS_API_URL, {
       method: "POST",
@@ -916,6 +943,84 @@ async function createTicketInSheets(selectedMonth: string, form: NewTicketForm) 
       payload,
     });
   }
+}
+
+async function createTicketInSheets(selectedMonth: string, form: NewTicketForm) {
+  return postSheetsAction({
+    action: "addTicket",
+    mois: getApiMonthName(selectedMonth),
+    date: form.date,
+    montant: form.amount,
+    description: form.description,
+    categorie: form.category,
+  });
+}
+
+function normalizeAuthResponseAccount(data: unknown) {
+  const payload = data as Record<string, unknown>;
+  const account = normalizeAccountProfile(payload.account ?? payload.user ?? payload.profile ?? null);
+
+  if (!account) {
+    const keys = data && typeof data === "object" ? Object.keys(payload) : [];
+    throw new Error(
+      `Reponse compte invalide. Cles recues: ${keys.length ? keys.join(", ") : "aucune"}.`
+    );
+  }
+
+  return account;
+}
+
+async function signInAccountInSheets(email: string, password: string) {
+  const response = (await postSheetsAction({
+    action: "signInAccount",
+    email,
+    password,
+  })) as { success?: boolean; error?: string; account?: unknown; user?: unknown; profile?: unknown };
+
+  if (response?.success === false) {
+    throw new Error(response.error || "Connexion refusee par le serveur.");
+  }
+
+  return normalizeAuthResponseAccount(response);
+}
+
+async function signUpAccountInSheets(form: SignUpForm) {
+  const response = (await postSheetsAction({
+    action: "signUpAccount",
+    email: normalizeEmail(form.email),
+    password: form.password,
+    firstName: form.firstName.trim(),
+    lastName: form.lastName.trim(),
+    cursorColor: form.cursorColor,
+  })) as { success?: boolean; error?: string; account?: unknown; user?: unknown; profile?: unknown };
+
+  if (response?.success === false) {
+    throw new Error(response.error || "Creation du compte refusee par le serveur.");
+  }
+
+  return normalizeAuthResponseAccount(response);
+}
+
+async function updateRemoteAccountInSheets(
+  currentAccount: AccountProfile,
+  form: AccountSettingsForm
+) {
+  const response = (await postSheetsAction({
+    action: "updateAccountProfile",
+    currentEmail: currentAccount.email,
+    currentPassword: form.currentPassword,
+    nextEmail: normalizeEmail(form.email),
+    firstName: form.firstName.trim(),
+    lastName: form.lastName.trim(),
+    cursorColor: form.cursorColor,
+    newPassword: form.newPassword,
+  })) as { success?: boolean; error?: string; account?: unknown; user?: unknown; profile?: unknown };
+
+  if (response?.success === false) {
+    throw new Error(response.error || "Mise a jour du compte refusee par le serveur.");
+  }
+
+  return normalizeAuthResponseAccount(response);
 }
 
 function getErrorMessage(error: unknown) {
@@ -1903,9 +2008,9 @@ function renderAuthScreen(
           </p>
 
           <div className="auth-benefits">
-            <div className="status info">Profil personnel persistant dans l app.</div>
+            <div className="status info">Compte distant persistant meme apres reinstallation.</div>
             <div className="status info">Couleur du curseur deja prete pour le multi.</div>
-            <div className="status info">Connexion locale simple pour cette premiere version.</div>
+            <div className="status info">Connexion email et mot de passe depuis n importe quel PC.</div>
           </div>
         </div>
 
@@ -2141,6 +2246,41 @@ function renderSettings(
               </div>
             </div>
 
+            <label className="field-block">
+              <span>Mot de passe actuel</span>
+              <input
+                className="field-input"
+                type="password"
+                value={form.currentPassword}
+                onChange={(event) => onChange({ currentPassword: event.target.value })}
+                placeholder="Obligatoire pour sauvegarder"
+              />
+            </label>
+
+            <div className="auth-grid">
+              <label className="field-block">
+                <span>Nouveau mot de passe</span>
+                <input
+                  className="field-input"
+                  type="password"
+                  value={form.newPassword}
+                  onChange={(event) => onChange({ newPassword: event.target.value })}
+                  placeholder="Optionnel"
+                />
+              </label>
+
+              <label className="field-block">
+                <span>Confirmation nouveau mot de passe</span>
+                <input
+                  className="field-input"
+                  type="password"
+                  value={form.confirmPassword}
+                  onChange={(event) => onChange({ confirmPassword: event.target.value })}
+                  placeholder="Retape le nouveau mot de passe"
+                />
+              </label>
+            </div>
+
             {profileStatus ? <div className="status ok">{profileStatus}</div> : null}
             {profileError ? <div className="status warn">{profileError}</div> : null}
 
@@ -2172,7 +2312,7 @@ function renderSettings(
               Ton curseur apparaitra avec cette couleur dans la vue collab.
             </div>
             <div className="status info">
-              Cette base prepare deja l arrivee d une vraie connexion multi plus tard.
+              Ton profil peut maintenant vivre au dela du stockage local de l app.
             </div>
           </div>
         </article>
@@ -2231,14 +2371,13 @@ function renderSettings(
 
 function App() {
   const [page, setPage] = useState<PageKey>(getInitialPage);
-  const [accounts, setAccounts] = useState<AccountProfile[]>(loadStoredAccounts);
-  const [currentAccountEmail, setCurrentAccountEmail] = useState(loadStoredSessionEmail);
+  const [currentAccount, setCurrentAccount] = useState<AccountProfile | null>(loadStoredSessionAccount);
   const [authMode, setAuthMode] = useState<AuthMode>("signin");
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState("");
   const [authStatus, setAuthStatus] = useState("");
   const [signInForm, setSignInForm] = useState<SignInForm>({
-    email: loadStoredSessionEmail(),
+    email: loadStoredSessionAccount()?.email || "",
     password: "",
   });
   const [signUpForm, setSignUpForm] = useState<SignUpForm>({
@@ -2254,6 +2393,9 @@ function App() {
     lastName: "",
     email: "",
     cursorColor: collabColors[0],
+    currentPassword: "",
+    newPassword: "",
+    confirmPassword: "",
   });
   const [accountSettingsLoading, setAccountSettingsLoading] = useState(false);
   const [accountSettingsStatus, setAccountSettingsStatus] = useState("");
@@ -2312,8 +2454,6 @@ function App() {
   const lastPointerSentAtRef = useRef(0);
   const startupUpdaterCheckedRef = useRef(false);
   const deferredTicketSearch = useDeferredValue(ticketSearch);
-  const currentAccount =
-    accounts.find((account) => normalizeEmail(account.email) === normalizeEmail(currentAccountEmail)) || null;
   const isTauriRuntime =
     typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
   const ticketCategoryChoices = getTicketCategoryChoices(tickets);
@@ -2359,16 +2499,13 @@ function App() {
       lastName: currentAccount.lastName,
       email: currentAccount.email,
       cursorColor: currentAccount.cursorColor,
+      currentPassword: "",
+      newPassword: "",
+      confirmPassword: "",
     });
     setAccountSettingsStatus("");
     setAccountSettingsError("");
   }, [currentAccount]);
-
-  useEffect(() => {
-    if (!currentAccount && accounts.length === 0) {
-      setAuthMode("signup");
-    }
-  }, [accounts.length, currentAccount]);
 
   useEffect(() => {
     if (!currentAccount) {
@@ -2701,15 +2838,9 @@ function App() {
       setAuthError("");
       setAuthStatus("");
 
-      const passwordHash = await hashPassword(password);
-      const account = accounts.find((item) => normalizeEmail(item.email) === email);
-
-      if (!account || account.passwordHash !== passwordHash) {
-        throw new Error("Identifiants invalides.");
-      }
-
-      persistSessionEmail(account.email);
-      setCurrentAccountEmail(account.email);
+      const account = await signInAccountInSheets(email, password);
+      persistSessionAccount(account);
+      setCurrentAccount(account);
       setSignInForm((current) => ({ ...current, password: "" }));
       setAuthStatus(`Connexion reussie. Bonjour ${account.firstName || account.email}.`);
     } catch (error) {
@@ -2741,35 +2872,14 @@ function App() {
       return;
     }
 
-    if (accounts.some((item) => normalizeEmail(item.email) === email)) {
-      setAuthError("Un compte existe deja avec cet email.");
-      return;
-    }
-
     try {
       setAuthLoading(true);
       setAuthError("");
       setAuthStatus("");
 
-      const passwordHash = await hashPassword(password);
-      const account: AccountProfile = {
-        id:
-          typeof crypto !== "undefined" && "randomUUID" in crypto
-            ? crypto.randomUUID()
-            : `account-${Date.now()}`,
-        email,
-        firstName,
-        lastName,
-        cursorColor: signUpForm.cursorColor,
-        passwordHash,
-        createdAt: new Date().toISOString(),
-      };
-
-      const nextAccounts = [...accounts, account];
-      setAccounts(nextAccounts);
-      persistAccounts(nextAccounts);
-      persistSessionEmail(account.email);
-      setCurrentAccountEmail(account.email);
+      const account = await signUpAccountInSheets(signUpForm);
+      persistSessionAccount(account);
+      setCurrentAccount(account);
       setAuthMode("signin");
       setSignInForm({ email: account.email, password: "" });
       setSignUpForm({
@@ -2789,16 +2899,16 @@ function App() {
   };
 
   const handleLogout = () => {
-    persistSessionEmail("");
-    setCurrentAccountEmail("");
+    persistSessionAccount(null);
+    setCurrentAccount(null);
     setAuthMode("signin");
     setAuthError("");
     setAuthStatus("");
-    setSignInForm((current) => ({ ...current, password: "" }));
+    setSignInForm((current) => ({ ...current, email: currentAccount?.email || current.email, password: "" }));
     setPage("dashboard");
   };
 
-  const handleSaveAccountSettings = () => {
+  const handleSaveAccountSettings = async () => {
     if (!currentAccount) {
       return;
     }
@@ -2806,44 +2916,45 @@ function App() {
     const nextEmail = normalizeEmail(accountSettingsForm.email);
     const nextFirstName = accountSettingsForm.firstName.trim();
     const nextLastName = accountSettingsForm.lastName.trim();
+    const currentPassword = accountSettingsForm.currentPassword;
+    const newPassword = accountSettingsForm.newPassword;
+    const confirmPassword = accountSettingsForm.confirmPassword;
 
     if (!nextFirstName || !nextLastName || !nextEmail) {
       setAccountSettingsError("Prenom, nom et email sont obligatoires.");
       return;
     }
 
-    if (
-      accounts.some(
-        (item) =>
-          item.id !== currentAccount.id &&
-          normalizeEmail(item.email) === nextEmail
-      )
-    ) {
-      setAccountSettingsError("Cet email est deja utilise par un autre compte.");
+    if (!currentPassword) {
+      setAccountSettingsError("Le mot de passe actuel est obligatoire pour sauvegarder.");
       return;
     }
 
-    setAccountSettingsLoading(true);
-    setAccountSettingsError("");
+    if ((newPassword || confirmPassword) && newPassword.length < 6) {
+      setAccountSettingsError("Le nouveau mot de passe doit faire au moins 6 caracteres.");
+      return;
+    }
 
-    const nextAccounts = accounts.map((item) =>
-      item.id === currentAccount.id
-        ? {
-            ...item,
-            firstName: nextFirstName,
-            lastName: nextLastName,
-            email: nextEmail,
-            cursorColor: accountSettingsForm.cursorColor,
-          }
-        : item
-    );
+    if (newPassword !== confirmPassword) {
+      setAccountSettingsError("La confirmation du nouveau mot de passe ne correspond pas.");
+      return;
+    }
 
-    setAccounts(nextAccounts);
-    persistAccounts(nextAccounts);
-    persistSessionEmail(nextEmail);
-    setCurrentAccountEmail(nextEmail);
-    setAccountSettingsStatus("Profil mis a jour.");
-    setAccountSettingsLoading(false);
+    try {
+      setAccountSettingsLoading(true);
+      setAccountSettingsError("");
+      setAccountSettingsStatus("");
+
+      const updatedAccount = await updateRemoteAccountInSheets(currentAccount, accountSettingsForm);
+      persistSessionAccount(updatedAccount);
+      setCurrentAccount(updatedAccount);
+      setSignInForm((current) => ({ ...current, email: updatedAccount.email }));
+      setAccountSettingsStatus("Profil distant mis a jour.");
+    } catch (error) {
+      setAccountSettingsError(getErrorMessage(error));
+    } finally {
+      setAccountSettingsLoading(false);
+    }
   };
 
   const runUpdaterCheck = async ({ silent = false }: { silent?: boolean } = {}) => {
