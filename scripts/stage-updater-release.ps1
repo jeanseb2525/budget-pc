@@ -63,10 +63,11 @@ $latestJson = [ordered]@{
   }
 }
 
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 [System.IO.File]::WriteAllText(
   $latestJsonPath,
   ($latestJson | ConvertTo-Json -Depth 10),
-  [System.Text.Encoding]::UTF8
+  $utf8NoBom
 )
 
 Write-Output "RELEASE_DIR=$releaseRoot"

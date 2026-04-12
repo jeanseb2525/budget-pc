@@ -41,6 +41,7 @@ $config.plugins | Add-Member -NotePropertyName "updater" -NotePropertyValue ([ps
 }) -Force
 
 $json = $config | ConvertTo-Json -Depth 100
-[System.IO.File]::WriteAllText($releaseConfigPath, $json, [System.Text.Encoding]::UTF8)
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($releaseConfigPath, $json, $utf8NoBom)
 
 Write-Output "UPDATER_CONFIG=$releaseConfigPath"
