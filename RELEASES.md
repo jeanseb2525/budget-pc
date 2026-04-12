@@ -1,0 +1,122 @@
+# Release et mises a jour
+
+## Ce que fait le projet maintenant
+
+- `npm run desktop:deliver`
+  Cree l installateur simple a partager en local.
+
+- `npm run desktop:release:deliver`
+  Cree l installateur signe pour les mises a jour et prepare un dossier `release/windows` avec :
+  - `Budget PC Installer.exe`
+  - `Budget PC Installer.exe.sig`
+  - `latest.json`
+
+L application verifie ensuite les mises a jour depuis `Parametres` et aussi automatiquement au demarrage.
+
+## 1. Generer la cle updater une seule fois
+
+Commande officielle Tauri :
+
+```powershell
+npm run tauri signer generate -- -w "$HOME\\.tauri\\budget-pc.key"
+```
+
+Garde bien :
+
+- la cle privee en lieu sur
+- la cle publique pour les builds de release
+
+La cle privee ne doit jamais etre commit.
+
+## 2. Variables a definir avant une release
+
+Dans PowerShell :
+
+```powershell
+$env:TAURI_UPDATER_PUBKEY="-----BEGIN PUBLIC KEY-----`nCOLLE_ICI_TA_CLE_PUBLIQUE`n-----END PUBLIC KEY-----"
+$env:TAURI_UPDATER_ENDPOINTS="https://github.com/<owner>/<repo>/releases/latest/download/latest.json"
+$env:TAURI_RELEASE_DOWNLOAD_BASE_URL="https://github.com/<owner>/<repo>/releases/latest/download"
+$env:TAURI_SIGNING_PRIVATE_KEY="$HOME\\.tauri\\budget-pc.key"
+$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""
+```
+
+Notes :
+
+- `TAURI_UPDATER_ENDPOINTS` est l URL lue par l app installee.
+- `TAURI_RELEASE_DOWNLOAD_BASE_URL` sert a fabriquer le `latest.json`.
+- `TAURI_SIGNING_PRIVATE_KEY` est obligatoire pour signer l installateur et sa mise a jour.
+
+La doc officielle Tauri precise bien que la signature se fait avec les variables d environnement au moment du build, pas via un fichier `.env` :
+https://v2.tauri.app/plugin/updater/
+
+## 3. Sortir une nouvelle version
+
+1. Monte la version dans :
+   - `package.json`
+   - `src-tauri/tauri.conf.json`
+   - `src-tauri/Cargo.toml`
+2. Lance :
+
+```powershell
+npm run desktop:release:deliver
+```
+
+3. Recupere les fichiers dans :
+   - [release/windows](c:/Users/jean-/Desktop/APP_test/budget-pc/release/windows)
+
+## 4. Publier sur GitHub Releases
+
+Le projet contient deja un workflow GitHub :
+
+- [.github/workflows/release.yml](c:/Users/jean-/Desktop/APP_test/budget-pc/.github/workflows/release.yml)
+
+Donc apres la configuration initiale, tu n auras plus besoin d uploader a la main.
+
+Le workflow :
+
+- build la version Windows NSIS
+- signe les artefacts updater
+- cree ou met a jour la GitHub Release du tag
+- publie les fichiers necessaires a l updater
+
+L endpoint vise ensuite :
+
+```text
+https://github.com/<owner>/<repo>/releases/latest/download/latest.json
+```
+
+## 5. Premiere mise en place GitHub
+
+1. Cree un repo GitHub pour le projet.
+2. Push le code dessus.
+3. Dans `Settings > Secrets and variables > Actions`, ajoute :
+
+Secrets :
+
+- `TAURI_SIGNING_PRIVATE_KEY`
+- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
+- `TAURI_UPDATER_PUBKEY`
+
+4. Commit le workflow.
+5. Quand tu veux sortir une version, cree un tag :
+
+```powershell
+git tag v0.1.1
+git push origin v0.1.1
+```
+
+6. GitHub Actions fera la release automatiquement.
+
+## 6. Cote utilisateur
+
+Quand toi ou ta copine ouvrez l app :
+
+- l app verifie la presence d une nouvelle version
+- une banniere apparait si une MAJ existe
+- clic sur `Installer la MAJ`
+- Tauri telecharge puis installe la nouvelle version
+
+## References officielles
+
+- Plugin updater Tauri : https://v2.tauri.app/plugin/updater/
+- Tauri Action GitHub Releases : https://github.com/tauri-apps/tauri-action
