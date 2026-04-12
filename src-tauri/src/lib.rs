@@ -4,6 +4,8 @@ use serde_json::Value;
 #[cfg(desktop)]
 use std::sync::Mutex;
 #[cfg(desktop)]
+use std::time::Duration;
+#[cfg(desktop)]
 use tauri::{AppHandle, Manager, State};
 #[cfg(desktop)]
 use tauri_plugin_updater::{Update, UpdaterExt};
@@ -208,6 +210,7 @@ async fn fetch_app_update(
         .pubkey(pubkey)
         .endpoints(endpoints)
         .map_err(|error| format!("Impossible de configurer les endpoints updater: {error}"))?
+        .timeout(Duration::from_secs(20))
         .build()
         .map_err(|error| format!("Impossible de preparer l updater: {error}"))?
         .check()
@@ -269,6 +272,14 @@ pub fn run() {
         .setup(|app| {
             #[cfg(desktop)]
             {
+                if let Ok((pubkey, _)) = load_updater_runtime_config() {
+                    app.handle().plugin(
+                        tauri_plugin_updater::Builder::new()
+                            .pubkey(pubkey)
+                            .build(),
+                    )?;
+                }
+
                 app.manage(PendingUpdate(Mutex::new(None)));
             }
 
