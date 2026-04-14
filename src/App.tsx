@@ -1,5 +1,6 @@
-import { invoke } from "@tauri-apps/api/core";
+﻿import { invoke } from "@tauri-apps/api/core";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { createClient, type RealtimeChannel } from "@supabase/supabase-js";
 import {
   useDeferredValue,
   useEffect,
@@ -7,6 +8,7 @@ import {
   useState,
   type PointerEvent as ReactPointerEvent,
 } from "react";
+import { createPortal } from "react-dom";
 import "./App.css";
 
 type PageKey =
@@ -17,7 +19,8 @@ type PageKey =
   | "compare"
   | "subscriptions"
   | "collab"
-  | "settings";
+  | "settings"
+  | "version";
 
 type Ticket = {
   date: string;
@@ -26,6 +29,14 @@ type Ticket = {
   amount: number;
   sent: boolean;
   sortIndex?: number;
+};
+
+type TicketMonthSummary = {
+  accountBalance: number | null;
+  currentRemaining: number | null;
+  theoreticalRemaining: number | null;
+  unexpectedSpendTotal: number | null;
+  source: "sheet" | "fallback";
 };
 
 type MonthOption = {
@@ -41,6 +52,36 @@ type NewTicketForm = {
   category: string;
 };
 
+type ReimbursementFormLine = {
+  category: string;
+  amount: string;
+};
+
+type ReimbursementDetailsEntry = {
+  row: number;
+  category: string;
+  amount: number;
+};
+
+type DashboardSubscription = {
+  id: string;
+  label: string;
+  amount: number;
+};
+
+type ReimbursementDetails = {
+  entries: ReimbursementDetailsEntry[];
+  ceTotal: number;
+  medecinTotal: number;
+  total: number;
+};
+
+type ReimbursementRemoteHistoryAction = {
+  kind: "delete";
+  month: string;
+  entry: ReimbursementDetailsEntry;
+};
+
 type TicketStatusFilter = "all" | "sent" | "pending";
 type TicketSortMode =
   | "date_desc"
@@ -54,6 +95,18 @@ type CollabIdentity = {
   name: string;
   color: string;
   seed: string;
+};
+
+type TicketBudgetLine = {
+  key: string;
+  label: string;
+  planned: number;
+  matchCategories: string[];
+};
+
+type TicketBudgetComputedLine = TicketBudgetLine & {
+  actual: number;
+  difference: number;
 };
 
 type AccountProfile = {
@@ -105,15 +158,70 @@ type AvailableUpdate = {
   pubDate?: string | null;
 };
 
+type HistorySnapshot = {
+  page: PageKey;
+  selectedMonth: string;
+  ticketSearch: string;
+  ticketCategoryFilter: string;
+  ticketStatusFilter: TicketStatusFilter;
+  ticketSortMode: TicketSortMode;
+  reimbursementForm: ReimbursementFormLine;
+  sharedNote: string;
+};
+
+type HistoryState = {
+  past: HistorySnapshot[];
+  future: HistorySnapshot[];
+};
+
+type HistoryEvent = {
+  id: string;
+  tone: "info" | "ok" | "warn";
+  source: "app" | "sheet";
+  title: string;
+  detail: string;
+  shortcut: "Ctrl+Z" | "Ctrl+Y" | null;
+  createdAt: number;
+  author?: string;
+};
+
 type Collaborator = CollabIdentity & {
   page: PageKey;
   context: string;
   cursorX: number;
   cursorY: number;
+  scrollY: number;
   insideBoard: boolean;
   lastSeen: number;
   focusTicketKey: string;
   focusTicketLabel: string;
+};
+
+type PointerState = {
+  x: number;
+  y: number;
+  visible: boolean;
+};
+
+type CollabSignalKind = "ping" | "assist" | "celebrate" | "focus";
+
+type CollabFeedItem = {
+  id: string;
+  text: string;
+  tone: "info" | "ok" | "warn";
+  createdAt: number;
+  color: string;
+};
+
+type CollabSignal = {
+  id: string;
+  emoji: string;
+  label: string;
+  author: string;
+  color: string;
+  x: number;
+  y: number;
+  createdAt: number;
 };
 
 type CollabMessage =
@@ -130,6 +238,7 @@ type CollabMessage =
       page: PageKey;
       x: number;
       y: number;
+      scrollY: number;
       insideBoard: boolean;
       timestamp: number;
     }
@@ -150,6 +259,27 @@ type CollabMessage =
   | {
       type: "leave";
       userId: string;
+      timestamp: number;
+    }
+  | {
+      type: "signal";
+      user: CollabIdentity;
+      signalId: string;
+      kind: CollabSignalKind;
+      x: number;
+      y: number;
+      timestamp: number;
+    }
+  | {
+      type: "history";
+      user: CollabIdentity;
+      event: Omit<HistoryEvent, "id" | "createdAt">;
+      timestamp: number;
+    }
+  | {
+      type: "subscriptions";
+      user: CollabIdentity;
+      subscriptions: DashboardSubscription[];
       timestamp: number;
     };
 
@@ -191,6 +321,20 @@ declare global {
 }
 
 const SHEETS_API_URL = "https://script.google.com/macros/s/AKfycbwiV5Xihpr77T_SthbLxTLijPw2vxTIww619Ys7-PvKSruEiKRc--NXlNDEHuFF3IpmMQ/exec";
+const SUPABASE_URL = "https://jyosnqsabeamcaezvrkl.supabase.co";
+const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_W_ArI-N5a97me-AXd1MM2w_21_3C1ax";
+const SUPABASE_COLLAB_CHANNEL = "budget-pc-live-collab";
+const supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
+  auth: {
+    persistSession: false,
+    autoRefreshToken: false,
+  },
+  realtime: {
+    params: {
+      eventsPerSecond: 24,
+    },
+  },
+});
 
 const monthOptions: MonthOption[] = [
   { value: "01", label: "Janvier", apiName: "Janvier" },
@@ -207,6 +351,11 @@ const monthOptions: MonthOption[] = [
   { value: "12", label: "Decembre", apiName: "Décembre" },
 ];
 
+function getCurrentMonthValue() {
+  const monthValue = String(new Date().getMonth() + 1).padStart(2, "0");
+  return monthOptions.some((month) => month.value === monthValue) ? monthValue : "01";
+}
+
 const euro = new Intl.NumberFormat("fr-FR", {
   style: "currency",
   currency: "EUR",
@@ -215,15 +364,30 @@ const euro = new Intl.NumberFormat("fr-FR", {
 const categoryOptions = [
   "🛒 Courses",
   "🍔 Fast-Food",
-  "🍽️Restaurant",
+  "🍽️ Restaurant",
   "🚲 Uber eats",
   "📱 Téléphonie",
   "🎬 Netflix",
   "🚚 Amazon Prime",
   "🍏 Apple / Spotify",
-  "🧺Quotidien",
+  "🧺 Quotidien",
   "❓ Autres",
 ];
+
+const ticketsFinancePreset = {
+  monthlyIncome: 2200,
+  budgetLines: [
+    { key: "courses", label: "Courses", planned: 350, matchCategories: [categoryOptions[0]] },
+    { key: "fast_food", label: "Fast-Food / Livraison", planned: 140, matchCategories: [categoryOptions[1], categoryOptions[3]] },
+    { key: "restaurant", label: "Restaurant", planned: 120, matchCategories: [categoryOptions[2]] },
+    { key: "telephonie", label: "Téléphonie", planned: 20, matchCategories: [categoryOptions[4]] },
+    { key: "netflix", label: "Netflix", planned: 14, matchCategories: [categoryOptions[5]] },
+    { key: "amazon_prime", label: "Amazon Prime", planned: 7, matchCategories: [categoryOptions[6]] },
+    { key: "apple_spotify", label: "Apple / Spotify", planned: 18, matchCategories: [categoryOptions[7]] },
+    { key: "quotidien", label: "Quotidien", planned: 120, matchCategories: [categoryOptions[8]] },
+    { key: "autres", label: "Autres", planned: 90, matchCategories: [categoryOptions[9]] },
+  ] satisfies TicketBudgetLine[],
+};
 
 const voiceHints = [
   "Date: aujourd'hui, hier, 12 avril ou 12/04/2026",
@@ -237,19 +401,19 @@ const voiceStepOrder: VoiceStep[] = ["date", "amount", "description", "confirm"]
 const spokenMonthMap: Record<string, string> = {
   janvier: "01",
   fevrier: "02",
-  février: "02",
+  "février": "02",
   mars: "03",
   avril: "04",
   mai: "05",
   juin: "06",
   juillet: "07",
   aout: "08",
-  août: "08",
+  "août": "08",
   septembre: "09",
   octobre: "10",
   novembre: "11",
   decembre: "12",
-  décembre: "12",
+  "décembre": "12",
 };
 
 const categoryKeywords: Array<{ category: string; keywords: string[] }> = [
@@ -279,7 +443,8 @@ const categoryKeywords: Array<{ category: string; keywords: string[] }> = [
   { category: categoryOptions[8], keywords: ["quotidien", "pharmacie", "maison", "entretien"] },
 ];
 
-const categoryShare = [
+// @ts-expect-error reserved for future use
+const _categoryShare = [
   { label: "Fast-food", value: 36, tone: "salmon" },
   { label: "Courses", value: 28, tone: "gold" },
   { label: "Abonnements", value: 21, tone: "sky" },
@@ -330,6 +495,11 @@ const pageMeta: Record<
     subtitle: "Personnalise les categories, exports et reglages desktop.",
     action: "Sauvegarder",
   },
+  version: {
+    title: "Version",
+    subtitle: "Mises a jour, notes de version et historique des releases.",
+    action: "Verifier",
+  },
 };
 
 const collabChannelName = "budget-pc-collab-lab";
@@ -337,7 +507,9 @@ const collabIdentityStoragePrefix = "budget-pc-collab-identity";
 const collabSharedNoteStorageKey = "budget-pc-collab-shared-note";
 const authAccountsStorageKey = "budget-pc-auth-accounts";
 const authSessionStorageKey = "budget-pc-auth-session";
+const dashboardSubscriptionsStorageKey = "budget-pc-dashboard-subscriptions";
 const collabPresenceTimeoutMs = 7_000;
+const collabSignalLifetimeMs = 4_800;
 const collabColors = ["#f58d68", "#f2c56e", "#76d0b2", "#90bbea", "#ff9b7a", "#b8a1ff"];
 const pageKeys: PageKey[] = [
   "dashboard",
@@ -348,7 +520,18 @@ const pageKeys: PageKey[] = [
   "subscriptions",
   "collab",
   "settings",
+  "version",
 ];
+const collabSignalPresets: Record<
+  CollabSignalKind,
+  { emoji: string; label: string; tone: "info" | "ok" | "warn" }
+> = {
+  ping: { emoji: "•", label: "Ping", tone: "info" },
+  assist: { emoji: "?", label: "Besoin d aide", tone: "warn" },
+  celebrate: { emoji: "+", label: "Bien joue", tone: "ok" },
+  focus: { emoji: "@", label: "Regarde ici", tone: "info" },
+};
+const reimbursementCategoryOptions = ["🚬 CE", "⚕️ Medecin"];
 
 function isPageKey(value: string | null): value is PageKey {
   return value !== null && pageKeys.includes(value as PageKey);
@@ -585,7 +768,124 @@ function toNumber(value: unknown): number {
   return 0;
 }
 
+function toNullableNumber(value: unknown): number | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : null;
+  }
+
+  if (typeof value === "string") {
+    const cleaned = value.trim();
+
+    if (!cleaned) {
+      return null;
+    }
+
+    const parsed = Number(cleaned.replace(",", ".").replace(/[^\d.-]/g, ""));
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  return null;
+}
+
+function normalizeTicketMonthSummary(data: unknown): TicketMonthSummary | null {
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    return null;
+  }
+
+  const payload = data as Record<string, unknown>;
+  const rawSummary =
+    payload.summary ?? payload.resume ?? payload.metrics ?? payload.kpis ?? null;
+
+  if (!rawSummary || typeof rawSummary !== "object" || Array.isArray(rawSummary)) {
+    return null;
+  }
+
+  const row = rawSummary as Record<string, unknown>;
+  const accountBalance = toNullableNumber(
+    row.accountBalance ??
+      row.soldeCompte ??
+      row.soldeDuCompte ??
+      row.soldesDuCompte ??
+      row.solde ??
+      row.balance
+  );
+  const currentRemaining = toNullableNumber(
+    row.currentRemaining ?? row.resteEnCours ?? row.reste_cours ?? row.remainingCurrent
+  );
+  const theoreticalRemaining = toNullableNumber(
+    row.theoreticalRemaining ??
+      row.resteTheorique ??
+      row.reste_theorique ??
+      row.remainingTheoretical
+  );
+  const derivedUnexpectedSpend =
+    currentRemaining !== null && theoreticalRemaining !== null
+      ? currentRemaining - theoreticalRemaining
+      : null;
+  const unexpectedSpendTotal =
+    toNullableNumber(
+      row.unexpectedSpendTotal ??
+        row.depenseNonPrevueTotal ??
+        row.depensesNonPrevues ??
+        row.delta ??
+        row.ecart
+    ) ?? derivedUnexpectedSpend;
+
+  if (
+    accountBalance === null &&
+    currentRemaining === null &&
+    theoreticalRemaining === null &&
+    unexpectedSpendTotal === null
+  ) {
+    return null;
+  }
+
+  return {
+    accountBalance,
+    currentRemaining,
+    theoreticalRemaining,
+    unexpectedSpendTotal,
+    source: "sheet",
+  };
+}
+
 function normalizeTickets(data: unknown): Ticket[] {
+  if (data && typeof data === "object" && !Array.isArray(data)) {
+    const payload = data as Record<string, unknown>;
+
+    if (payload.success === false) {
+      const backendError = String(payload.error ?? "").trim();
+      throw new Error(
+        backendError || "Le script Google Sheets a renvoye une erreur."
+      );
+    }
+
+    if (payload.success === true && Array.isArray(payload.tickets)) {
+      return payload.tickets.map((item) => {
+        const row = item as Record<string, unknown>;
+
+        return {
+          date: String(row.date ?? row.Date ?? row.ticketDate ?? ""),
+          description: String(
+            row.description ?? row.Description ?? row.libelle ?? row.label ?? ""
+          ),
+          category: String(
+            row.category ?? row.categorie ?? row.Category ?? row["catégorie"] ?? ""
+          ),
+          amount: toNumber(row.amount ?? row.montant ?? row.Amount ?? 0),
+          sent: toBoolean(row.sent ?? row.envoye ?? row.Envoye ?? row.sentToAnnual ?? false),
+          sortIndex: toNumber(
+            row.sortIndex ?? row.rowIndex ?? row.row ?? row.position ?? row.index ?? Number.NaN
+          ),
+        };
+      });
+    }
+  }
+
   const source = Array.isArray(data)
     ? data
     : Array.isArray((data as { tickets?: unknown[] })?.tickets)
@@ -608,7 +908,7 @@ function normalizeTickets(data: unknown): Ticket[] {
         row.description ?? row.Description ?? row.libelle ?? row.label ?? ""
       ),
       category: String(
-        row.category ?? row.categorie ?? row.Category ?? row.catégorie ?? ""
+        row.category ?? row.categorie ?? row.Category ?? row["catégorie"] ?? ""
       ),
       amount: toNumber(row.amount ?? row.montant ?? row.Amount ?? 0),
       sent: toBoolean(row.sent ?? row.envoye ?? row.Envoye ?? row.sentToAnnual ?? false),
@@ -956,6 +1256,83 @@ async function createTicketInSheets(selectedMonth: string, form: NewTicketForm) 
   });
 }
 
+function createEmptyReimbursementLine(): ReimbursementFormLine {
+  return {
+    category: "",
+    amount: "",
+  };
+}
+
+async function createReimbursementsInSheets(
+  selectedMonth: string,
+  entries: (ReimbursementFormLine & { targetRow?: number })[]
+) {
+  return postSheetsAction({
+    action: "addReimbursements",
+    mois: getApiMonthName(selectedMonth),
+    entries: entries
+      .map((entry) => ({
+        categorie: entry.category,
+        montant: entry.amount,
+        row: entry.targetRow,
+      }))
+      .filter((entry) => String(entry.categorie).trim() || String(entry.montant).trim()),
+  });
+}
+
+async function deleteReimbursementInSheets(selectedMonth: string, row: number) {
+  return postSheetsAction({
+    action: "deleteReimbursement",
+    mois: getApiMonthName(selectedMonth),
+    row,
+  });
+}
+
+function normalizeReimbursementDetails(data: unknown): ReimbursementDetails {
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    return {
+      entries: [],
+      ceTotal: 0,
+      medecinTotal: 0,
+      total: 0,
+    };
+  }
+
+  const payload = data as Record<string, unknown>;
+  const raw =
+    payload.reimbursements ??
+    payload.remboursements ??
+    payload.reimbursementDetails ??
+    null;
+
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return {
+      entries: [],
+      ceTotal: 0,
+      medecinTotal: 0,
+      total: 0,
+    };
+  }
+
+  const row = raw as Record<string, unknown>;
+  const rawEntries = Array.isArray(row.entries) ? row.entries : [];
+  const entries = rawEntries.map((entry) => {
+    const current = entry as Record<string, unknown>;
+    return {
+      row: toNumber(current.row ?? current.ligne ?? 0),
+      category: String(current.category ?? current.categorie ?? ""),
+      amount: toNumber(current.amount ?? current.montant ?? 0),
+    };
+  });
+
+  return {
+    entries,
+    ceTotal: toNumber(row.ceTotal ?? row.ce_total ?? 0),
+    medecinTotal: toNumber(row.medecinTotal ?? row.medecin_total ?? 0),
+    total: toNumber(row.total ?? 0),
+  };
+}
+
 function normalizeAuthResponseAccount(data: unknown) {
   const payload = data as Record<string, unknown>;
   const account = normalizeAccountProfile(payload.account ?? payload.user ?? payload.profile ?? null);
@@ -1048,7 +1425,162 @@ function getErrorMessage(error: unknown) {
   return "Impossible de charger les tickets Google Sheets.";
 }
 
+function normalizeCollaboratorPage(value: unknown): PageKey {
+  const candidate = typeof value === "string" ? value : "";
+  return isPageKey(candidate) ? candidate : "collab";
+}
+
+function normalizeRemoteCollaborator(value: unknown): Collaborator | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const row = value as Record<string, unknown>;
+  const id = String(row.id ?? row.sessionId ?? "").trim();
+
+  if (!id) {
+    return null;
+  }
+
+  return {
+    id,
+    seed: String(row.seed ?? id),
+    name: String(row.name ?? "Session distante"),
+    color: String(row.color ?? collabColors[0]),
+    page: normalizeCollaboratorPage(row.page),
+    context: String(row.context ?? ""),
+    cursorX: toNumber(row.cursorX ?? row.x ?? 50),
+    cursorY: toNumber(row.cursorY ?? row.y ?? 50),
+    scrollY: toNumber(row.scrollY ?? 0),
+    insideBoard: toBoolean(row.insideBoard ?? row.inside ?? false),
+    lastSeen: toNumber(row.lastSeen ?? row.timestamp ?? Date.now()),
+    focusTicketKey: String(row.focusTicketKey ?? ""),
+    focusTicketLabel: String(row.focusTicketLabel ?? ""),
+  };
+}
+
+function mergeCollaboratorLists(local: Collaborator[], remote: Collaborator[]) {
+  const merged = new Map<string, Collaborator>();
+
+  [...remote, ...local].forEach((item) => {
+    const existing = merged.get(item.id);
+
+    if (!existing || item.lastSeen >= existing.lastSeen) {
+      merged.set(item.id, item);
+    }
+  });
+
+  return [...merged.values()].sort((a, b) => b.lastSeen - a.lastSeen);
+}
+
+function buildSupabasePresencePayload(
+  identity: CollabIdentity,
+  page: PageKey,
+  selectedMonth: string,
+  pointer: PointerState,
+  focus: { key: string; label: string },
+  sharedNote: string,
+  sharedNoteUpdatedAt: number
+) {
+  return {
+    id: identity.id,
+    seed: identity.seed,
+    name: identity.name,
+    color: identity.color,
+    page,
+    context: getPresenceContext(page, selectedMonth),
+    cursorX: pointer.x,
+    cursorY: pointer.y,
+    insideBoard: pointer.visible,
+    lastSeen: Date.now(),
+    focusTicketKey: focus.key,
+    focusTicketLabel: focus.label,
+    sharedNoteText: sharedNote,
+    sharedNoteUpdatedAt,
+    sharedNoteUpdatedBy: identity.name,
+  };
+}
+
+function pruneRemoteCollaborators(current: Collaborator[]) {
+  const now = Date.now();
+  return current.filter((item) => now - item.lastSeen < collabPresenceTimeoutMs * 2);
+}
+
+function pruneCollabSignals(current: CollabSignal[]) {
+  const now = Date.now();
+  return current.filter((item) => now - item.createdAt < collabSignalLifetimeMs);
+}
+
+function appendCollabFeedItem(current: CollabFeedItem[], next: CollabFeedItem) {
+  const merged = [next, ...current.filter((item) => item.id !== next.id)];
+  return merged
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .slice(0, 10);
+}
+
+function appendCollabSignal(current: CollabSignal[], next: CollabSignal) {
+  return pruneCollabSignals([next, ...current.filter((item) => item.id !== next.id)]);
+}
+
+function formatPresenceAge(timestamp: number) {
+  const diff = Math.max(0, Date.now() - timestamp);
+  const seconds = Math.round(diff / 1000);
+
+  if (seconds <= 2) {
+    return "maintenant";
+  }
+
+  if (seconds < 60) {
+    return `${seconds}s`;
+  }
+
+  const minutes = Math.round(seconds / 60);
+  return `${minutes} min`;
+}
+
+function buildCollabFeedItem(
+  id: string,
+  text: string,
+  tone: "info" | "ok" | "warn",
+  color: string,
+  createdAt: number
+): CollabFeedItem {
+  return { id, text, tone, color, createdAt };
+}
+
+function createCollabSignalBubble(
+  signalId: string,
+  kind: CollabSignalKind,
+  author: string,
+  color: string,
+  x: number,
+  y: number,
+  createdAt: number
+) {
+  const preset = collabSignalPresets[kind];
+
+  return {
+    id: signalId,
+    emoji: preset.emoji,
+    label: preset.label,
+    author,
+    color,
+    x,
+    y,
+    createdAt,
+  } satisfies CollabSignal;
+}
+
 function renderGoogleSheetsError(error: string) {
+  const lowerError = error.toLowerCase();
+  const probableCause = lowerError.includes("getrecapdata")
+    ? "la fonction getRecapData manque dans Apps Script ou n est pas dans le bon projet"
+    : lowerError.includes("onglet introuvable")
+      ? "le mois demande n existe pas dans le Google Sheet"
+      : lowerError.includes("access") || lowerError.includes("autor")
+        ? "acces public ou autorisations Apps Script incorrectes"
+        : "acces public, JSON invalide, colonnes non reconnues";
+
   return (
     <div className="error-box">
       <strong>Diagnostic Google Sheets</strong>
@@ -1059,7 +1591,7 @@ function renderGoogleSheetsError(error: string) {
       </div>
       <div className="error-meta">
         <span>Causes probables</span>
-        <code>acces public, JSON invalide, colonnes non reconnues</code>
+        <code>{probableCause}</code>
       </div>
     </div>
   );
@@ -1067,6 +1599,32 @@ function renderGoogleSheetsError(error: string) {
 
 function getSelectedMonthLabel(selectedMonth: string) {
   return monthOptions.find((month) => month.value === selectedMonth)?.label ?? selectedMonth;
+}
+
+function computeTicketBudgetLines(tickets: Ticket[]): TicketBudgetComputedLine[] {
+  return ticketsFinancePreset.budgetLines.map((line) => {
+    const actual = tickets
+      .filter((ticket) => line.matchCategories.includes(ticket.category))
+      .reduce((sum, ticket) => sum + ticket.amount, 0);
+
+    return {
+      ...line,
+      actual,
+      difference: actual - line.planned,
+    };
+  });
+}
+
+function formatBudgetDifference(value: number) {
+  const abs = Math.abs(value);
+  const sign = value > 0 ? "+" : value < 0 ? "-" : "";
+  return `${sign}${euro.format(abs)}`;
+}
+
+function getBudgetDifferenceTone(value: number) {
+  if (value > 0.009) return "warn";
+  if (value < -0.009) return "ok";
+  return "neutral";
 }
 
 function renderMonthFilter(selectedMonth: string, onMonthChange: (month: string) => void) {
@@ -1264,108 +1822,131 @@ function renderDashboard(
   error: string,
   selectedMonth: string,
   lastSyncLabel: string,
+  reimbursementTotal: number,
+  subscriptions: DashboardSubscription[],
+  subPanelOpen: boolean,
+  subFormLabel: string,
+  subFormAmount: string,
+  subFormError: string,
   onMonthChange: (month: string) => void,
   onRefreshTickets: () => void,
-  onOpenTicketModal: () => void
+  onOpenTicketModal: () => void,
+  onToggleSubPanel: () => void,
+  onToggleSubDeletePanel: () => void,
+  onSubFormLabelChange: (v: string) => void,
+  onSubFormAmountChange: (v: string) => void,
+  onAddSubscription: () => void,
+  onDeleteSubscription: (id: string) => void,
+  subDeletePanelOpen: boolean
 ) {
   const monthlyTotal = tickets.reduce((sum, ticket) => sum + ticket.amount, 0);
   const sentCount = tickets.filter((ticket) => ticket.sent).length;
   const pendingCount = tickets.length - sentCount;
-  const recentTickets = tickets.slice(0, 3);
+  const recentTickets = tickets.slice(0, 6);
   const isBusy = loading || refreshing;
+
+  const monthlyIncome = ticketsFinancePreset.monthlyIncome;
+  const budgetLines = computeTicketBudgetLines(tickets);
+  const budgetPlannedTotal = budgetLines.reduce((sum, line) => sum + line.planned, 0);
+  const currentRemaining = monthlyIncome - monthlyTotal;
+  const theoreticalRemaining = monthlyIncome - budgetPlannedTotal;
+  const unexpectedSpend = currentRemaining - theoreticalRemaining;
+  const unexpectedSpendTone = getBudgetDifferenceTone(unexpectedSpend);
+  const sentRatio = tickets.length > 0 ? Math.round((sentCount / tickets.length) * 100) : 0;
+  const totalWithReimbursements = monthlyTotal + reimbursementTotal;
+
+  const dashboardStatus = loading
+    ? "Chargement des donnees..."
+    : error
+      ? "Connexion Google Sheets a verifier"
+      : lastSyncLabel
+        ? `Google Sheets OK • sync ${lastSyncLabel}`
+        : "Google Sheets OK • donnees chargees";
+
+  const archiveToneClass = pendingCount === 0 || sentRatio >= 70 ? "ok" : "warn";
+
+  const subTotal = subscriptions.reduce((s, item) => s + item.amount, 0);
 
   return (
     <>
-      <section className="hero-card">
-        <div className="hero-copy">
-          <span className="eyebrow">Budget desktop</span>
-          <h1>Un cockpit propre pour suivre tes depenses sans friction.</h1>
-          <p>
-            La base est prete pour evoluer en vrai logiciel de gestion:
-            navigation claire, synthese utile et modules bien separes.
-          </p>
+      <section className="panel dashboard-v3-top-panel">
+        <div className="dashboard-v3-top-grid">
+          <div className="dashboard-v3-left">
+            <h1>Budget mensuel</h1>
+          </div>
 
-          <div className="hero-actions">
-            <button className="primary-btn" onClick={onOpenTicketModal}>
-              Nouvelle depense
-            </button>
-            {refreshing ? <span className="sync-badge">Synchro...</span> : null}
-            <button className="ghost-btn" onClick={onRefreshTickets}>
-              {isBusy ? "Actualisation..." : "Actualiser"}
-            </button>
+          <div className="dashboard-v3-right">
+            <div className="dashboard-v3-period-card">
+              {renderMonthFilter(selectedMonth, onMonthChange)}
+            </div>
+
+            <div className="dashboard-v3-total-card">
+              <div className="dashboard-v3-total-main">
+                <span className="dashboard-v3-total-label">
+                  Total depenses + remboursement
+                </span>
+                <strong>{euro.format(totalWithReimbursements)}</strong>
+              </div>
+
+              <div className="dashboard-v3-total-meta">
+                <span>{euro.format(monthlyTotal)} depenses</span>
+                <span>{euro.format(reimbursementTotal)} remboursements</span>
+              </div>
+            </div>
+
+            <div className="dashboard-v3-status-line">
+              {refreshing ? <span className="sync-badge">Synchro...</span> : null}
+              <span>Etat connexion : {dashboardStatus}</span>
+            </div>
           </div>
         </div>
 
-        <div className="hero-aside">
-          {renderMonthFilter(selectedMonth, onMonthChange)}
-          <div className="hero-metric">
-            <span className="metric-label">Budget analyse</span>
-            <strong>{euro.format(monthlyTotal)}</strong>
-            <span className="metric-trend up">
-              {loading
-                ? "Chargement..."
-                : `${tickets.length} ticket(s) charges${lastSyncLabel ? ` • sync ${lastSyncLabel}` : ""}`}
-            </span>
-          </div>
-
-          <div className="hero-mini-grid">
-            <div className="hero-mini-tile tone-mint">
-              <span>Tickets valides</span>
-              <strong>{sentCount}</strong>
-            </div>
-            <div className="hero-mini-tile tone-gold">
-              <span>Tickets a revoir</span>
-              <strong>{pendingCount}</strong>
-            </div>
-            <div className="hero-mini-tile tone-sky">
-              <span>Abonnements</span>
-              <strong>6</strong>
-            </div>
-            <div className="hero-mini-tile tone-salmon">
-              <span>Alertes</span>
-              <strong>{error ? 1 : 0}</strong>
-            </div>
-          </div>
+        <div className="dashboard-v3-actions">
+          <button className="primary-btn" onClick={onOpenTicketModal}>
+            Nouvelle depense
+          </button>
+          <button className="outline-btn" onClick={onRefreshTickets}>
+            {isBusy ? "Actualisation..." : "Actualiser"}
+          </button>
         </div>
       </section>
 
-      <section className="stats-grid">
-        <article className="card accent-blue">
-          <span className="card-label">Total du mois</span>
-          <strong className="card-value">{euro.format(monthlyTotal)}</strong>
-          <span className="card-sub">Flux issu de Google Sheets</span>
+      <section className="stats-grid dashboard-v3-kpi-grid">
+        <article className="card accent-blue dashboard-v3-kpi-card">
+          <span className="card-label">Solde du compte</span>
+          <strong className="card-value">{euro.format(currentRemaining)}</strong>
+          <span className="card-sub">Revenu - depenses du mois</span>
         </article>
 
-        <article className="card accent-gold">
-          <span className="card-label">Tickets traites</span>
-          <strong className="card-value">{tickets.length}</strong>
-          <span className="card-sub">Tickets charges dans l app</span>
+        <article className="card accent-mint dashboard-v3-kpi-card">
+          <span className="card-label">Reste en cours</span>
+          <strong className="card-value">{euro.format(currentRemaining)}</strong>
+          <span className="card-sub">Disponible estime actuellement</span>
         </article>
 
-        <article className="card accent-salmon">
-          <span className="card-label">A envoyer</span>
-          <strong className="card-value">{pendingCount}</strong>
-          <span className="card-sub">Encore non envoyes</span>
+        <article className="card accent-rose dashboard-v3-kpi-card">
+          <span className="card-label">Reste theorique</span>
+          <strong className="card-value">{euro.format(theoreticalRemaining)}</strong>
+          <span className="card-sub">Selon ton budget cible</span>
         </article>
 
-        <article className="card accent-mint">
-          <span className="card-label">Objectifs budget</span>
-          <strong className="card-value">{sentCount}</strong>
-          <span className="card-sub">Tickets deja envoyes</span>
+        <article className="card accent-salmon dashboard-v3-kpi-card">
+          <span className="card-label">Depense non prevue</span>
+          <strong className={`card-value tickets-diff-text ${unexpectedSpendTone}`}>
+            {formatBudgetDifference(unexpectedSpend)}
+          </strong>
+          <span className="card-sub">Ecart reel vs theorique</span>
         </article>
       </section>
 
-      <section className="content-grid">
-        <article className="panel">
-          <div className="panel-head">
-            <div>
+      <section className="dashboard-v3-bottom-grid">
+        <article className="panel dashboard-v3-activity-panel">
+          <div className="panel-body dashboard-v3-activity-body">
+            <div className="dashboard-v3-side-head">
               <span className="panel-kicker">Activite recente</span>
-              <h2>Derniers mouvements</h2>
+              <h2>Derniers tickets</h2>
             </div>
-            <button className="panel-link">Ouvrir le journal</button>
-          </div>
 
-          <div className="panel-body stack">
             {loading && <div className="status info">Chargement des tickets...</div>}
 
             {!loading && error && renderGoogleSheetsError(error)}
@@ -1373,98 +1954,245 @@ function renderDashboard(
             {!loading &&
               !error &&
               recentTickets.map((ticket, index) => (
-                <div className="activity-item" key={`${ticket.date}-${ticket.description}-${index}`}>
-                  <div>
+                <div className="dashboard-v3-subscription-row" key={`${ticket.date}-${ticket.description}-${index}`}>
+                  <div className="dashboard-v3-ticket-row-info">
                     <strong>{ticket.description || "Sans description"}</strong>
-                    <span>
-                      {ticket.category || "Sans categorie"} • {ticket.date || "Sans date"}
-                    </span>
+                    <span>{ticket.category || "Sans categorie"} • {ticket.date || "Sans date"}</span>
                   </div>
                   <strong>{euro.format(ticket.amount)}</strong>
                 </div>
               ))}
 
             {!loading && !error && recentTickets.length === 0 && (
-              <div className="status info">Aucun ticket trouve.</div>
+              <div className="status info">Aucun ticket trouve pour ce mois.</div>
             )}
           </div>
         </article>
 
-        <article className="panel">
-          <div className="panel-head">
-            <div>
-              <span className="panel-kicker">Etat rapide</span>
-              <h2>Points de controle</h2>
-            </div>
-          </div>
-
-          <div className="panel-body stack">
-            {!loading && !error && <div className="status ok">Connexion Google Sheets OK.</div>}
-            {loading && <div className="status info">Chargement en cours.</div>}
-            {error && renderGoogleSheetsError(error)}
-            <div className="status info">Le comparateur est alimente avec les donnees chargees.</div>
-          </div>
-        </article>
-      </section>
-
-      <section className="content-grid lower-grid">
-        <article className="panel">
-          <div className="panel-head">
-            <div>
-              <span className="panel-kicker">Repartition</span>
-              <h2>Poids des categories</h2>
-            </div>
-          </div>
-
-          <div className="panel-body stack">
-            {categoryShare.map((item) => (
-              <div className="progress-row" key={item.label}>
-                <div className="progress-head">
-                  <span>{item.label}</span>
-                  <strong>{item.value}%</strong>
-                </div>
-                <div className="progress-track">
-                  <div
-                    className={`progress-bar ${item.tone}`}
-                    style={{ width: `${item.value}%` }}
-                  />
+        <article className="panel dashboard-v3-side-panel">
+          <div className="panel-body dashboard-v3-side-panel-body">
+            <div className="dashboard-v3-side-section">
+              <div className="dashboard-v3-side-head">
+                <span className="panel-kicker">
+                  {subscriptions.length > 0
+                    ? `${subscriptions.length} abonnement${subscriptions.length > 1 ? "s" : ""} actif${subscriptions.length > 1 ? "s" : ""} \u2022 ${euro.format(subTotal)}/mois`
+                    : "Aucun abonnement enregistre"}
+                </span>
+                <div className="dashboard-v3-sub-title-row">
+                  <h2>Abonnements</h2>
+                  <div className="dashboard-v3-sub-btn-group">
+                    <button
+                      type="button"
+                      className="dashboard-v3-sub-manage-btn"
+                      onClick={onToggleSubPanel}
+                    >
+                      + Ajouter
+                    </button>
+                    {subscriptions.length > 0 && (
+                      <button
+                        type="button"
+                        className="dashboard-v3-sub-manage-btn dashboard-v3-sub-manage-btn-delete"
+                        onClick={onToggleSubDeletePanel}
+                      >
+                        − Supprimer
+                      </button>
+                    )}
+                  </div>
                 </div>
               </div>
-            ))}
-          </div>
-        </article>
 
-        <article className="panel spotlight-panel">
-          <div className="panel-head">
-            <div>
-              <span className="panel-kicker">Signal du mois</span>
-              <h2>Focus abonnement</h2>
+              {subscriptions.length > 0 && (
+                <div className="dashboard-v3-subscription-list">
+                  {subscriptions.map((item) => (
+                    <div className="dashboard-v3-subscription-row" key={item.id}>
+                      <span>{item.label}</span>
+                      <strong>{euro.format(item.amount)}</strong>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {subscriptions.length === 0 && (
+                <div className="dashboard-v3-sub-empty">
+                  Aucun abonnement pour le moment.
+                </div>
+              )}
             </div>
-          </div>
 
-          <div className="panel-body stack">
-            <p className="spotlight-copy">
-              Les depenses recurrentes representent une part stable du budget,
-              mais deux lignes meritent une renegociation avant avril.
-            </p>
-            <div className="spotlight-stat tone-gold">
-              <span>Gain potentiel</span>
-              <strong>{euro.format(18)}</strong>
+            <div className="dashboard-v3-divider" />
+
+            <div className="dashboard-v3-side-section">
+              <div className="dashboard-v3-side-head">
+                <span className="panel-kicker">{sentCount} envoyes sur {tickets.length} • {sentRatio}% traites</span>
+                <h2>Tickets archives</h2>
+              </div>
+
+              <div className={`dashboard-v3-archive-card ${archiveToneClass}`}>
+                <div className="dashboard-v3-archive-head">
+                  <span>Progression</span>
+                  <strong>{sentRatio}%</strong>
+                </div>
+
+                <div className="dashboard-v3-archive-track">
+                  <div
+                    className="dashboard-v3-archive-fill"
+                    style={{ width: `${sentRatio}%` }}
+                  />
+                </div>
+
+                <div className="dashboard-v3-archive-stats">
+                  <div className="dashboard-v3-archive-stat">
+                    <span>Envoyes</span>
+                    <strong>{sentCount}</strong>
+                  </div>
+                  <div className="dashboard-v3-archive-stat">
+                    <span>En attente</span>
+                    <strong>{pendingCount}</strong>
+                  </div>
+                  <div className="dashboard-v3-archive-stat">
+                    <span>Total</span>
+                    <strong>{tickets.length}</strong>
+                  </div>
+                </div>
+
+                {!error ? (
+                  <div className="status dashboard-v3-archive-status">
+                    {pendingCount === 0
+                      ? "Tous les tickets sont envoyes."
+                      : `${pendingCount} ticket(s) restent a envoyer.`}
+                  </div>
+                ) : (
+                  <div className="status warn">
+                    Etat connexion : Google Sheets a verifier.
+                  </div>
+                )}
+              </div>
             </div>
           </div>
         </article>
       </section>
+
+      {subPanelOpen && (
+        <div className="modal-backdrop" onClick={onToggleSubPanel}>
+          <div className="dashboard-v3-sub-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="dashboard-v3-sub-modal-head">
+              <div>
+                <span className="panel-kicker">Nouvel abonnement</span>
+                <h2>Ajouter un abonnement</h2>
+              </div>
+              <button type="button" className="modal-close" onClick={onToggleSubPanel}>
+                Fermer
+              </button>
+            </div>
+
+            <div className="dashboard-v3-sub-modal-body">
+              <label className="field-block">
+                <span>Nom de l'abonnement</span>
+                <input
+                  className="field-input"
+                  type="text"
+                  placeholder="Ex: Netflix, Spotify, SFR..."
+                  value={subFormLabel}
+                  onChange={(e) => onSubFormLabelChange(e.target.value)}
+                />
+              </label>
+
+              <label className="field-block">
+                <span>Prix mensuel</span>
+                <input
+                  className="field-input"
+                  type="text"
+                  inputMode="decimal"
+                  placeholder="Ex: 14,99"
+                  value={subFormAmount}
+                  onChange={(e) => onSubFormAmountChange(e.target.value)}
+                />
+              </label>
+
+              {subFormError && (
+                <p className="dashboard-v3-sub-form-error">{subFormError}</p>
+              )}
+            </div>
+
+            <div className="dashboard-v3-sub-modal-actions">
+              <button type="button" className="ghost-btn" onClick={onToggleSubPanel}>
+                Annuler
+              </button>
+              <button type="button" className="primary-btn" onClick={onAddSubscription}>
+                Ajouter l'abonnement
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {subDeletePanelOpen && (
+        <div className="modal-backdrop" onClick={onToggleSubDeletePanel}>
+          <div className="dashboard-v3-sub-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="dashboard-v3-sub-modal-head">
+              <div>
+                <span className="panel-kicker">{subscriptions.length} abonnement{subscriptions.length > 1 ? "s" : ""}</span>
+                <h2>Supprimer un abonnement</h2>
+              </div>
+              <button type="button" className="modal-close" onClick={onToggleSubDeletePanel}>
+                Fermer
+              </button>
+            </div>
+
+            <div className="dashboard-v3-sub-modal-body">
+              {subscriptions.length > 0 ? (
+                <div className="dashboard-v3-sub-delete-list">
+                  {subscriptions.map((item) => (
+                    <div className="dashboard-v3-sub-delete-row" key={item.id}>
+                      <div className="dashboard-v3-sub-delete-row-info">
+                        <strong>{item.label}</strong>
+                        <span>{euro.format(item.amount)}/mois</span>
+                      </div>
+                      <button
+                        type="button"
+                        className="dashboard-v3-sub-delete-btn"
+                        onClick={() => onDeleteSubscription(item.id)}
+                      >
+                        Supprimer
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="dashboard-v3-sub-empty">
+                  Tous les abonnements ont ete supprimes.
+                </div>
+              )}
+            </div>
+
+            <div className="dashboard-v3-sub-modal-actions">
+              <button type="button" className="ghost-btn" onClick={onToggleSubDeletePanel}>
+                Fermer
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 }
 
 function renderTickets(
   tickets: Ticket[],
+  monthSummary: TicketMonthSummary | null,
   totalTicketsCount: number,
   loading: boolean,
   refreshing: boolean,
   error: string,
   collaborators: Collaborator[],
+  budgetPreviewTicket: Ticket | null,
+  budgetDetailsOpen: boolean,
+  reimbursementForm: ReimbursementFormLine,
+  reimbursementDetails: ReimbursementDetails,
+  reimbursementSubmitting: boolean,
+  deletingReimbursementRow: number | null,
+  reimbursementStatus: string,
+  reimbursementError: string,
   selectedMonth: string,
   lastSyncLabel: string,
   searchQuery: string,
@@ -1479,32 +2207,71 @@ function renderTickets(
   onStatusFilterChange: (value: TicketStatusFilter) => void,
   onSortModeChange: (value: TicketSortMode) => void,
   onOpenTicketModal: () => void,
+  onCloseBudgetDetails: () => void,
+  onReimbursementFormChange: (patch: Partial<ReimbursementFormLine>) => void,
+  onSubmitReimbursements: () => void,
+  onDeleteReimbursement: (row: number) => void,
   onTicketHover: (ticket: Ticket) => void,
   onTicketLeave: () => void
 ) {
   const monthlyTotal = tickets.reduce((sum, ticket) => sum + ticket.amount, 0);
-  const sentCount = tickets.filter((ticket) => ticket.sent).length;
-  const pendingCount = tickets.length - sentCount;
-  const fastFoodTotal = tickets
-    .filter((ticket) => ticket.category.toLowerCase() === "fast-food")
-    .reduce((sum, ticket) => sum + ticket.amount, 0);
   const isBusy = loading || refreshing;
+  const selectedMonthLabel = getSelectedMonthLabel(selectedMonth);
+
+  const budgetLines = computeTicketBudgetLines(tickets);
+  const budgetPlannedTotal = budgetLines.reduce((sum, line) => sum + line.planned, 0);
+  const budgetActualTotal = budgetLines.reduce((sum, line) => sum + line.actual, 0);
+  const budgetDifferenceTotal = budgetActualTotal - budgetPlannedTotal;
+
+  const monthlyIncome = ticketsFinancePreset.monthlyIncome;
+  const currentBalance = monthlyIncome - monthlyTotal;
+  const theoreticalRemaining = monthlyIncome - budgetPlannedTotal;
+  const accountBalanceValue = monthSummary?.accountBalance ?? null;
+  const currentRemainingValue = monthSummary?.currentRemaining ?? currentBalance;
+  const theoreticalRemainingValue =
+    monthSummary?.theoreticalRemaining ?? theoreticalRemaining;
+  const unexpectedSpendTotalValue =
+    monthSummary?.unexpectedSpendTotal ??
+    (currentRemainingValue !== null && theoreticalRemainingValue !== null
+      ? currentRemainingValue - theoreticalRemainingValue
+      : null);
+  const unexpectedSpendTone =
+    unexpectedSpendTotalValue !== null
+      ? getBudgetDifferenceTone(unexpectedSpendTotalValue)
+      : "neutral";
+  const showMonthLoading = loading;
+
+  const renderStatsCardLoader = () => (
+    <div className="card-loading-content" aria-hidden="true">
+      <div className="card-loader-shell">
+        <div className="card-loader">
+          <span className="card-loader-ring" />
+          <span className="card-loader-orbit" />
+          <span className="card-loader-core" />
+        </div>
+      </div>
+
+      <div className="card-loading-skeletons">
+        <span className="card-skeleton card-skeleton-value" />
+        <span className="card-skeleton card-skeleton-sub" />
+      </div>
+    </div>
+  );
 
   return (
     <>
-      <section className="topbar">
+      <section className="topbar tickets-topbar">
         <div>
           <span className="eyebrow">Tickets</span>
           <h1>Vue mensuelle des depenses capturees</h1>
           <p>
             Un espace compact pour verifier le flux, les montants et l etat d envoi
-            sur {getSelectedMonthLabel(selectedMonth).toLowerCase()}.
+            sur {selectedMonthLabel.toLowerCase()}.
           </p>
         </div>
         <div className="topbar-actions">
           {renderMonthFilter(selectedMonth, onMonthChange)}
-          {refreshing ? <span className="sync-badge">Synchro...</span> : null}
-          <button className="ghost-btn" onClick={onRefreshTickets}>
+          <button className="ghost-btn refresh-btn" onClick={onRefreshTickets}>
             {isBusy ? "Actualisation..." : "Actualiser"}
           </button>
           <button className="primary-btn" onClick={onOpenTicketModal}>
@@ -1513,29 +2280,55 @@ function renderTickets(
         </div>
       </section>
 
-      <section className="stats-grid">
-        <article className="card accent-blue">
-          <span className="card-label">Total affiche</span>
-          <strong className="card-value">{euro.format(monthlyTotal)}</strong>
-          <span className="card-sub">{tickets.length} tickets visibles</span>
+      <section className="stats-grid tickets-stats-grid">
+        <article className={`card accent-blue ${showMonthLoading ? "card-loading" : ""}`}>
+          <span className="card-label">Solde du compte</span>
+          {showMonthLoading ? (
+            renderStatsCardLoader()
+          ) : (
+            <>
+              <strong className="card-value">
+                {accountBalanceValue !== null ? euro.format(accountBalanceValue) : "--"}
+              </strong>
+            </>
+          )}
         </article>
 
-        <article className="card accent-salmon">
-          <span className="card-label">Fast-food</span>
-          <strong className="card-value">{euro.format(fastFoodTotal)}</strong>
-          <span className="card-sub">Categorie detectee</span>
+        <article className={`card accent-mint ${showMonthLoading ? "card-loading" : ""}`}>
+          <span className="card-label">Reste en cours</span>
+          {showMonthLoading ? (
+            renderStatsCardLoader()
+          ) : (
+            <>
+              <strong className="card-value">{euro.format(currentRemainingValue)}</strong>
+            </>
+          )}
         </article>
 
-        <article className="card accent-mint">
-          <span className="card-label">Deja envoyes</span>
-          <strong className="card-value">{sentCount}</strong>
-          <span className="card-sub">{pendingCount} restants</span>
+        <article className={`card accent-rose ${showMonthLoading ? "card-loading" : ""}`}>
+          <span className="card-label">Reste theorique</span>
+          {showMonthLoading ? (
+            renderStatsCardLoader()
+          ) : (
+            <>
+              <strong className="card-value">{euro.format(theoreticalRemainingValue)}</strong>
+            </>
+          )}
         </article>
 
-        <article className="card accent-gold">
-          <span className="card-label">Anomalies</span>
-          <strong className="card-value">{error ? 1 : 0}</strong>
-          <span className="card-sub">Controle de chargement</span>
+        <article className={`card accent-salmon ${showMonthLoading ? "card-loading" : ""}`}>
+          <span className="card-label">Depense non prevue total</span>
+          {showMonthLoading ? (
+            renderStatsCardLoader()
+          ) : (
+            <>
+              <strong className={`card-value tickets-diff-text ${unexpectedSpendTone}`}>
+                {unexpectedSpendTotalValue !== null
+                  ? formatBudgetDifference(unexpectedSpendTotalValue)
+                  : "--"}
+              </strong>
+            </>
+          )}
         </article>
       </section>
 
@@ -1544,75 +2337,97 @@ function renderTickets(
           <div className="panel-head">
             <div>
               <span className="panel-kicker">Registre</span>
-              <h2>Liste des tickets</h2>
+              <div className="panel-title-row">
+                <h2>Liste des tickets</h2>
+                {refreshing ? <span className="sync-badge">Synchro...</span> : null}
+              </div>
             </div>
             <button className="panel-link">Exporter</button>
           </div>
 
           <div className="panel-body table-body">
             <div className="ticket-toolbar">
-              <div className="ticket-toolbar-grid">
-                <input
-                  className="field-input"
-                  type="search"
-                  value={searchQuery}
-                  placeholder="Rechercher un ticket, une date ou une categorie"
-                  onChange={(event) => onSearchChange(event.target.value)}
-                />
+              <div className="ticket-toolbar-head">
+                <div className="ticket-toolbar-title">
+                  <span className="ticket-toolbar-kicker">Recherche et filtres</span>
+                  <strong>Affinage instantane des tickets</strong>
+                </div>
 
-                <select
-                  className="field-input"
-                  value={categoryFilter}
-                  onChange={(event) => onCategoryFilterChange(event.target.value)}
-                >
-                  <option value="all">Toutes les categories</option>
-                  {categoryChoices.map((category) => (
-                    <option key={category} value={category}>
-                      {category}
-                    </option>
-                  ))}
-                </select>
-
-                <select
-                  className="field-input"
-                  value={statusFilter}
-                  onChange={(event) =>
-                    onStatusFilterChange(event.target.value as TicketStatusFilter)
-                  }
-                >
-                  <option value="all">Tous les statuts</option>
-                  <option value="sent">Deja envoyes</option>
-                  <option value="pending">A envoyer</option>
-                </select>
-
-                <select
-                  className="field-input"
-                  value={sortMode}
-                  onChange={(event) => onSortModeChange(event.target.value as TicketSortMode)}
-                >
-                  <option value="date_desc">Plus recents</option>
-                  <option value="date_asc">Plus anciens</option>
-                  <option value="amount_desc">Montant decroissant</option>
-                  <option value="amount_asc">Montant croissant</option>
-                  <option value="description_asc">Description A-Z</option>
-                </select>
+                <div className="ticket-toolbar-meta">
+                  <span>{tickets.length} ticket(s) affiches sur {totalTicketsCount}</span>
+                  <span>
+                    {searchQuery.trim() || categoryFilter !== "all" || statusFilter !== "all"
+                      ? "Filtres actifs"
+                      : refreshing
+                        ? "Synchro en cours..."
+                        : lastSyncLabel
+                          ? `Synchro ${lastSyncLabel}`
+                          : "Vue complete"}
+                  </span>
+                </div>
               </div>
 
-              <div className="ticket-toolbar-meta">
-                <span>
-                  {tickets.length} ticket(s) affiches sur {totalTicketsCount}
-                </span>
-                {searchQuery.trim() || categoryFilter !== "all" || statusFilter !== "all" ? (
-                  <span>Filtres actifs</span>
-                ) : (
-                  <span>
-                    {refreshing
-                      ? "Synchro en cours..."
-                      : lastSyncLabel
-                        ? `Synchro ${lastSyncLabel}`
-                        : "Vue complete"}
-                  </span>
-                )}
+              <div className="ticket-toolbar-grid">
+                <label className="ticket-filter-group ticket-filter-group-search">
+                  <span>Recherche</span>
+                  <input
+                    data-history-global="true"
+                    className="field-input"
+                    type="search"
+                    value={searchQuery}
+                    placeholder="Rechercher un ticket, une date ou une categorie"
+                    onChange={(event) => onSearchChange(event.target.value)}
+                  />
+                </label>
+
+                <label className="ticket-filter-group">
+                  <span>Categorie</span>
+                  <select
+                    data-history-global="true"
+                    className="field-input"
+                    value={categoryFilter}
+                    onChange={(event) => onCategoryFilterChange(event.target.value)}
+                  >
+                    <option value="all">Toutes les categories</option>
+                    {categoryChoices.map((category) => (
+                      <option key={category} value={category}>
+                        {category}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label className="ticket-filter-group">
+                  <span>Statut</span>
+                  <select
+                    data-history-global="true"
+                    className="field-input"
+                    value={statusFilter}
+                    onChange={(event) =>
+                      onStatusFilterChange(event.target.value as TicketStatusFilter)
+                    }
+                  >
+                    <option value="all">Tous les statuts</option>
+                    <option value="sent">Deja envoyes</option>
+                    <option value="pending">A envoyer</option>
+                  </select>
+                </label>
+
+                <label className="ticket-filter-group">
+                  <span>Tri</span>
+                  <select
+                    data-history-global="true"
+                    className="field-input"
+                    value={sortMode}
+                    onChange={(event) => onSortModeChange(event.target.value as TicketSortMode)}
+                  >
+                    <option value="date_desc">Plus recents</option>
+                    <option value="date_asc">Plus anciens</option>
+                    <option value="amount_desc">Montant decroissant</option>
+                    <option value="amount_asc">Montant croissant</option>
+                    <option value="description_asc">Description A-Z</option>
+                  </select>
+                </label>
               </div>
             </div>
 
@@ -1628,35 +2443,43 @@ function renderTickets(
 
                 return (
                   <div
-                  className={`ticket-row ${watchingPeers.length ? "ticket-row-active" : ""}`}
-                  key={`${ticket.date}-${ticket.description}-${index}`}
-                  onMouseEnter={() => onTicketHover(ticket)}
-                  onMouseLeave={onTicketLeave}
-                >
-                  <div className="ticket-main">
-                    <strong>{ticket.description || "Sans description"}</strong>
-                    <span>
-                      {ticket.date || "Sans date"} • {ticket.category || "Sans categorie"}
-                    </span>
-                    {watchingPeers.length ? (
-                      <div className="ticket-peer-list">
-                        {watchingPeers.map((peer) => (
-                          <span className="ticket-peer-chip" key={`${peer.id}-${ticketKey}`}>
-                            <span
-                              className="collab-dot"
-                              style={{ backgroundColor: peer.color }}
-                            />
-                            {peer.name} regarde ce ticket
-                          </span>
-                        ))}
+                    className={`ticket-row ${watchingPeers.length ? "ticket-row-active" : ""}`}
+                    key={`${ticket.date}-${ticket.description}-${index}`}
+                    onMouseEnter={() => onTicketHover(ticket)}
+                    onMouseLeave={onTicketLeave}
+                  >
+                    <div className="ticket-main">
+                      <div className="ticket-title-row">
+                        <strong>{ticket.description || "Sans description"}</strong>
                       </div>
-                    ) : null}
+
+                      <div className="ticket-meta-row">
+                        <span className="ticket-meta-chip">{ticket.date || "Sans date"}</span>
+                        <span className="ticket-meta-chip">{ticket.category || "Sans categorie"}</span>
+                      </div>
+
+                      {watchingPeers.length ? (
+                        <div className="ticket-peer-list">
+                          {watchingPeers.map((peer) => (
+                            <span className="ticket-peer-chip" key={`${peer.id}-${ticketKey}`}>
+                              <span
+                                className="collab-dot"
+                                style={{ backgroundColor: peer.color }}
+                              />
+                              {peer.name} regarde ce ticket
+                            </span>
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
+
+                    <div className="ticket-side">
+                      <span className={`ticket-badge ${ticket.sent ? "sent" : "pending"}`}>
+                        {ticket.sent ? "Envoye" : "En attente"}
+                      </span>
+                      <strong className="ticket-amount">{euro.format(ticket.amount)}</strong>
+                    </div>
                   </div>
-                  <span className={`ticket-badge ${ticket.sent ? "sent" : "pending"}`}>
-                    {ticket.sent ? "Envoye" : "En attente"}
-                  </span>
-                  <strong className="ticket-amount">{euro.format(ticket.amount)}</strong>
-                </div>
                 );
               })}
 
@@ -1666,32 +2489,211 @@ function renderTickets(
           </div>
         </article>
 
-        <article className="panel">
+        <article className="panel tickets-budget-panel">
           <div className="panel-head">
             <div>
-              <span className="panel-kicker">Resume</span>
-              <h2>Actions rapides</h2>
+              <span className="panel-kicker">Remboursements</span>
+              <h2>Saisie rapide</h2>
             </div>
           </div>
 
-          <div className="panel-body stack">
-            <div className="status ok">{sentCount} tickets sont deja dans le flux d envoi.</div>
-            <div className="status warn">{pendingCount} tickets demandent encore une validation.</div>
-            <div className="status info">Le poste fast-food reste le plus actif cette semaine.</div>
+          <div className="panel-body tickets-budget-body">
+            <div className="tickets-reimburse-card">
+              <div className="tickets-special-head">
+                <span className="tickets-impact-kicker">Section remboursements du sheet</span>
+                <strong>Ajoute un remboursement en une fois</strong>
+              </div>
+
+              <div className="tickets-reimburse-row">
+                <select
+                  data-history-global="true"
+                  className="field-input"
+                  value={reimbursementForm.category}
+                  onChange={(event) => onReimbursementFormChange({ category: event.target.value })}
+                >
+                  <option value="">Selectionner</option>
+                  {reimbursementCategoryOptions.map((option) => (
+                    <option key={option} value={option}>
+                      {option}
+                    </option>
+                  ))}
+                </select>
+
+                <input
+                  data-history-global="true"
+                  className="field-input"
+                  type="text"
+                  inputMode="decimal"
+                  value={reimbursementForm.amount}
+                  placeholder="Montant"
+                  onChange={(event) => onReimbursementFormChange({ amount: event.target.value })}
+                />
+              </div>
+
+              {reimbursementStatus ? <div className="status ok">{reimbursementStatus}</div> : null}
+              {reimbursementError ? <div className="status warn">{reimbursementError}</div> : null}
+
+              <div className="reimbursement-active-card">
+                <div className="reimbursement-active-head">
+                  <div>
+                    <span className="tickets-impact-kicker">Actifs sur {selectedMonthLabel}</span>
+                    <strong>Remboursements en cours</strong>
+                  </div>
+                  <div className="reimbursement-active-summary">
+                    <span>{reimbursementDetails.entries.length} ligne(s)</span>
+                    <strong>{euro.format(reimbursementDetails.total)}</strong>
+                  </div>
+                </div>
+
+                {reimbursementDetails.entries.length ? (
+                  <div className="reimbursement-active-list">
+                    {reimbursementDetails.entries.map((entry) => {
+                      const isDeleting = deletingReimbursementRow === entry.row;
+
+                      return (
+                        <div
+                          className={`reimbursement-active-item ${isDeleting ? "reimbursement-deleting" : ""}`}
+                          key={`reimbursement-inline-row-${entry.row}`}
+                        >
+                          {isDeleting ? (
+                            <div className="reimbursement-deleting-overlay">
+                              <div className="card-loader">
+                                <span className="card-loader-ring" />
+                                <span className="card-loader-orbit" />
+                                <span className="card-loader-core" />
+                              </div>
+                              <span className="reimbursement-deleting-label">Suppression...</span>
+                            </div>
+                          ) : null}
+
+                          <div className="reimbursement-active-main">
+                            <span className="reimbursement-active-type">{entry.category}</span>
+                            <strong>{euro.format(entry.amount)}</strong>
+                          </div>
+
+                          <span className="reimbursement-active-cell">{`H${entry.row} / I${entry.row}`}</span>
+
+                          <button
+                            type="button"
+                            className="ghost-btn reimbursement-inline-delete"
+                            onClick={() => onDeleteReimbursement(entry.row)}
+                            disabled={isDeleting}
+                            title={`Supprimer ${entry.category} en H${entry.row}`}
+                          >
+                            {isDeleting ? "..." : "✕"}
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <div className="reimbursement-empty-state">
+                    Aucun remboursement actif pour le moment sur ce mois.
+                  </div>
+                )}
+              </div>
+
+              <div className="tickets-special-note">
+                {budgetPreviewTicket
+                  ? `Ticket survole: ${budgetPreviewTicket.description || "Sans description"} • ${budgetPreviewTicket.category || "Sans categorie"}`
+                  : "Le nouveau remboursement sera ajoute dans le premier emplacement libre du mois."}
+              </div>
+
+              <div className="ticket-modal-actions">
+                <button
+                  type="button"
+                  className="primary-btn"
+                  onClick={onSubmitReimbursements}
+                  disabled={reimbursementSubmitting}
+                >
+                  {reimbursementSubmitting ? "Enregistrement..." : "Ajouter les remboursements"}
+                </button>
+              </div>
+            </div>
+
             {collaborators.some((peer) => peer.page === "tickets") ? (
-              <div className="mini-note">
+              <div className="tickets-special-note">
                 {collaborators
                   .filter((peer) => peer.page === "tickets")
-                  .map((peer) => `${peer.name} sur ${peer.context || getSelectedMonthLabel(selectedMonth)}`)
+                  .map((peer) => `${peer.name} sur ${peer.context || selectedMonthLabel}`)
                   .join(" • ")}
               </div>
             ) : null}
-            <div className="mini-note">
-              Ici, on affichera ensuite les vrais filtres, tris et actions desktop Tauri.
-            </div>
           </div>
         </article>
       </section>
+
+      {budgetDetailsOpen ? (
+        <div className="budget-overlay" onClick={onCloseBudgetDetails}>
+          <div className="budget-modal" onClick={(event) => event.stopPropagation()}>
+            <div className="budget-modal-head">
+              <div>
+                <span className="eyebrow">Budget du mois</span>
+                <h2>Prevu / Reel / Difference</h2>
+                <p>Vue complete des lignes budget pour {selectedMonthLabel.toLowerCase()}.</p>
+              </div>
+
+              <button type="button" className="modal-close" onClick={onCloseBudgetDetails}>
+                Fermer
+              </button>
+            </div>
+
+            <div className="budget-modal-summary">
+              <div className="budget-modal-tile">
+                <span>Revenus</span>
+                <strong>{euro.format(monthlyIncome)}</strong>
+              </div>
+
+              <div className="budget-modal-tile">
+                <span>Total prevu</span>
+                <strong>{euro.format(budgetPlannedTotal)}</strong>
+              </div>
+
+              <div className="budget-modal-tile">
+                <span>Total reel</span>
+                <strong>{euro.format(budgetActualTotal)}</strong>
+              </div>
+
+              <div className="budget-modal-tile">
+                <span>Difference globale</span>
+                <strong className={getBudgetDifferenceTone(budgetDifferenceTotal)}>
+                  {formatBudgetDifference(budgetDifferenceTotal)}
+                </strong>
+              </div>
+            </div>
+
+            <div className="budget-table">
+              <div className="budget-table-head">
+                <span>Categorie</span>
+                <span>Prevu</span>
+                <span>Reel</span>
+                <span>Difference</span>
+              </div>
+
+              {budgetLines.map((line) => {
+                const tone = getBudgetDifferenceTone(line.difference);
+
+                return (
+                  <div className="budget-table-row" key={line.key}>
+                    <span className="budget-table-cell budget-table-label">{line.label}</span>
+                    <span className="budget-table-cell">{euro.format(line.planned)}</span>
+                    <span className="budget-table-cell">{euro.format(line.actual)}</span>
+                    <span className={`budget-table-cell budget-table-diff ${tone}`}>
+                      {formatBudgetDifference(line.difference)}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+
+            <div className="budget-modal-foot">
+              Revenu de reference actuel: {euro.format(monthlyIncome)}. Tu peux l ajuster dans
+              <code> ticketsFinancePreset </code>.
+            </div>
+          </div>
+        </div>
+      ) : null}
+
     </>
   );
 }
@@ -1702,24 +2704,33 @@ function renderCollab(
   sharedNote: string,
   collabStatus: string,
   collabError: string,
+  collabFeed: CollabFeedItem[],
+  collabSignals: CollabSignal[],
+  followedPeerId: string,
+  collabConnectionState: "connecting" | "live" | "unstable",
   onNameChange: (value: string) => void,
   onSharedNoteChange: (value: string) => void,
   onOpenSecondSession: () => void,
-  onBoardPointerMove: (event: React.PointerEvent<HTMLDivElement>) => void,
-  onBoardPointerLeave: () => void
+  onBoardPointerMove: (event: ReactPointerEvent<HTMLDivElement>) => void,
+  onBoardPointerLeave: () => void,
+  onSendSignal: (kind: CollabSignalKind) => void,
+  onClearSharedNote: () => void,
+  onFollowPeerChange: (peerId: string) => void
 ) {
   const activePeers = collaborators.filter((item) => Date.now() - item.lastSeen < collabPresenceTimeoutMs);
-  const boardPeers = activePeers.filter((item) => item.page === "collab" && item.insideBoard);
+  const boardPeers = activePeers.filter((item) => item.insideBoard && item.page === "collab");
+  const followedPeer =
+    activePeers.find((item) => item.id === followedPeerId) || activePeers[0] || null;
 
   return (
     <>
       <section className="topbar">
         <div>
           <span className="eyebrow">Mode multi</span>
-          <h1>Collab locale style Canva, testable sur un seul PC.</h1>
+          <h1>Collab live enrichie</h1>
           <p>
-            Ouvre une deuxieme session, bouge la souris dans la zone de test et tu verras
-            l autre curseur apparaitre en direct.
+            Presence, curseurs, reactions, suivi de session et journal live :
+            la collab devient enfin lisible et utile en duo.
           </p>
         </div>
         <div className="topbar-actions">
@@ -1748,7 +2759,7 @@ function renderCollab(
         <article className="card accent-mint">
           <span className="card-label">Utilisateurs en ligne</span>
           <strong className="card-value">{activePeers.length + 1}</strong>
-          <span className="card-sub">Toi compris, sur cette machine</span>
+          <span className="card-sub">Toi compris, tous postes confondus</span>
         </article>
 
         <article className="card accent-gold">
@@ -1757,10 +2768,16 @@ function renderCollab(
           <span className="card-sub">Dans la zone de collaboration</span>
         </article>
 
-        <article className="card accent-salmon">
-          <span className="card-label">Bloc-note partage</span>
-          <strong className="card-value">{sharedNote.length}</strong>
-          <span className="card-sub">Caracteres synchro en live</span>
+        <article className={`card ${collabConnectionState === "live" ? "accent-mint" : collabConnectionState === "unstable" ? "accent-salmon" : "accent-gold"}`}>
+          <span className="card-label">Etat live</span>
+          <strong className="card-value">
+            {collabConnectionState === "live"
+              ? "Connecte"
+              : collabConnectionState === "unstable"
+              ? "Instable"
+              : "Connexion"}
+          </strong>
+          <span className="card-sub">Temps reel Supabase</span>
         </article>
       </section>
 
@@ -1768,8 +2785,8 @@ function renderCollab(
         <article className="panel collab-board-panel">
           <div className="panel-head">
             <div>
-              <span className="panel-kicker">Canvas local</span>
-              <h2>Zone curseurs partages</h2>
+              <span className="panel-kicker">Canvas partage</span>
+              <h2>Zone curseurs et signaux</h2>
             </div>
             <div className="collab-legend">
               <span className="collab-dot" style={{ backgroundColor: collabIdentity.color }} />
@@ -1778,29 +2795,51 @@ function renderCollab(
           </div>
 
           <div className="panel-body">
+            <div className="ticket-modal-actions" style={{ marginBottom: 14 }}>
+              <button type="button" className="ghost-btn" onClick={() => onSendSignal("ping")}>
+                Ping
+              </button>
+              <button type="button" className="ghost-btn" onClick={() => onSendSignal("assist")}>
+                Besoin d aide
+              </button>
+              <button type="button" className="ghost-btn" onClick={() => onSendSignal("celebrate")}>
+                Bien joue
+              </button>
+              <button type="button" className="ghost-btn" onClick={() => onSendSignal("focus")}>
+                Regarde ici
+              </button>
+            </div>
+
             <div
               className="collab-board"
               onPointerMove={onBoardPointerMove}
               onPointerLeave={onBoardPointerLeave}
             >
               <div className="collab-board-copy">
-                <strong>Déplace ta souris ici</strong>
-                <span>Les autres sessions ouvertes sur ton PC verront ton curseur bouger ici en direct.</span>
+                <strong>Deplace ta souris ici</strong>
+                <span>Les autres sessions voient le curseur et les signaux en direct.</span>
               </div>
 
-              {boardPeers.map((peer) => (
+              {collabSignals.map((signal) => (
                 <div
+                  key={signal.id}
                   className="remote-cursor"
-                  key={peer.id}
                   style={{
-                    left: `${peer.cursorX}%`,
-                    top: `${peer.cursorY}%`,
+                    left: `${signal.x}%`,
+                    top: `${signal.y}%`,
+                    pointerEvents: "none",
                   }}
                 >
-                  <div className="remote-cursor-pin" style={{ backgroundColor: peer.color }} />
-                  <div className="remote-cursor-tag" style={{ borderColor: peer.color }}>
-                    <span className="collab-dot" style={{ backgroundColor: peer.color }} />
-                    <strong>{peer.name}</strong>
+                  <div
+                    className="remote-cursor-tag"
+                    style={{
+                      borderColor: signal.color,
+                      background: "rgba(15, 18, 28, 0.92)",
+                    }}
+                  >
+                    <span className="collab-dot" style={{ backgroundColor: signal.color }} />
+                    <strong>{signal.emoji} {signal.label}</strong>
+                    <span>{signal.author}</span>
                   </div>
                 </div>
               ))}
@@ -1826,7 +2865,13 @@ function renderCollab(
             </div>
 
             {activePeers.map((peer) => (
-              <div className="collab-presence-card" key={peer.id}>
+              <button
+                type="button"
+                className={`collab-presence-card ${followedPeerId === peer.id ? "active" : ""}`}
+                key={peer.id}
+                onClick={() => onFollowPeerChange(peer.id)}
+                style={{ textAlign: "left" }}
+              >
                 <div className="collab-presence-row">
                   <span className="collab-dot" style={{ backgroundColor: peer.color }} />
                   <strong>{peer.name}</strong>
@@ -1835,13 +2880,14 @@ function renderCollab(
                   {getPageLabel(peer.page)}
                   {peer.context ? ` • ${peer.context}` : ""}
                 </span>
+                <span>Vu {formatPresenceAge(peer.lastSeen)}</span>
                 {peer.focusTicketLabel ? <span>{peer.focusTicketLabel}</span> : null}
-              </div>
+              </button>
             ))}
 
             {activePeers.length === 0 ? (
               <div className="status info">
-                Ouvre une deuxieme session pour voir une presence distante apparaitre ici.
+                Connecte un autre compte ou ouvre une autre session pour voir la presence distante.
               </div>
             ) : null}
 
@@ -1862,13 +2908,19 @@ function renderCollab(
 
           <div className="panel-body stack">
             <textarea
+              data-history-global="true"
               className="collab-note-input"
               value={sharedNote}
               onChange={(event) => onSharedNoteChange(event.target.value)}
               placeholder="Ecris ici depuis une session et regarde l autre se mettre a jour."
             />
+            <div className="ticket-modal-actions">
+              <button type="button" className="ghost-btn" onClick={onClearSharedNote}>
+                Vider le bloc-note
+              </button>
+            </div>
             <div className="mini-note">
-              Ce proto est 100% local: parfait pour valider l experience avant de brancher un vrai backend temps reel.
+              Cette version passe par ton backend Apps Script + Supabase pour faire vivre la collab.
             </div>
           </div>
         </article>
@@ -1876,30 +2928,55 @@ function renderCollab(
         <article className="panel spotlight-panel">
           <div className="panel-head">
             <div>
-              <span className="panel-kicker">Suite logique</span>
-              <h2>Apres le test souris</h2>
+              <span className="panel-kicker">Spotlight session</span>
+              <h2>Session suivie</h2>
             </div>
           </div>
 
           <div className="panel-body stack">
-            <div className="activity-item simple">
-              <div>
-                <strong>Presence par ticket</strong>
-                <span>Afficher qui regarde quel ticket ou quel mois.</span>
-              </div>
+            {followedPeer ? (
+              <>
+                <div className="activity-item simple">
+                  <div>
+                    <strong>{followedPeer.name}</strong>
+                    <span>
+                      {getPageLabel(followedPeer.page)}
+                      {followedPeer.context ? ` • ${followedPeer.context}` : ""}
+                    </span>
+                  </div>
+                </div>
+                <div className="status info">Derniere activite: {formatPresenceAge(followedPeer.lastSeen)}</div>
+                {followedPeer.focusTicketLabel ? (
+                  <div className="status ok">Focus en cours: {followedPeer.focusTicketLabel}</div>
+                ) : (
+                  <div className="status info">Aucun ticket mis en focus pour l instant.</div>
+                )}
+              </>
+            ) : (
+              <div className="status info">Aucune session distante a suivre pour l instant.</div>
+            )}
+          </div>
+        </article>
+
+        <article className="panel">
+          <div className="panel-head">
+            <div>
+              <span className="panel-kicker">Activite live</span>
+              <h2>Journal de session</h2>
             </div>
-            <div className="activity-item simple">
-              <div>
-                <strong>Selection partagee</strong>
-                <span>Montrer le ticket survole ou edite par l autre session.</span>
-              </div>
-            </div>
-            <div className="activity-item simple">
-              <div>
-                <strong>Backend temps reel</strong>
-                <span>Pousser ensuite la meme UX sur deux vraies machines.</span>
-              </div>
-            </div>
+          </div>
+
+          <div className="panel-body stack">
+            {collabFeed.length === 0 ? (
+              <div className="status info">Aucun evenement live pour le moment.</div>
+            ) : (
+              collabFeed.map((item) => (
+                <div className={`status ${item.tone}`} key={item.id}>
+                  <span className="collab-dot" style={{ backgroundColor: item.color, marginRight: 8 }} />
+                  {item.text}
+                </div>
+              ))
+            )}
           </div>
         </article>
       </section>
@@ -2160,16 +3237,8 @@ function renderSettings(
   profileLoading: boolean,
   profileStatus: string,
   profileError: string,
-  updaterStatus: UpdaterStatus | null,
-  availableUpdate: AvailableUpdate | null,
-  checkingUpdates: boolean,
-  installingUpdate: boolean,
-  updaterMessage: string,
-  updaterError: string,
   onChange: (patch: Partial<AccountSettingsForm>) => void,
   onSave: () => void,
-  onCheckUpdates: () => void,
-  onInstallUpdate: () => void,
   onLogout: () => void
 ) {
   return (
@@ -2316,57 +3385,408 @@ function renderSettings(
             </div>
           </div>
         </article>
-
-        <article className="panel">
-          <div className="panel-head">
-            <div>
-              <span className="panel-kicker">Mises a jour</span>
-              <h2>Version desktop et releases</h2>
-            </div>
-          </div>
-
-          <div className="panel-body stack">
-            <div className="activity-item simple">
-              <div>
-                <strong>Version actuelle</strong>
-                <span>{updaterStatus?.currentVersion || "0.1.0"}</span>
-              </div>
-            </div>
-
-            <div className={`status ${updaterStatus?.configured ? "ok" : "warn"}`}>
-              {updaterStatus?.configured
-                ? `Updater configure avec ${updaterStatus.endpointCount} endpoint(s).`
-                : "Updater non configure pour l instant. Il manque encore la cle publique et l endpoint de release."}
-            </div>
-
-            {availableUpdate ? (
-              <div className="status info">
-                Mise a jour detectee: v{availableUpdate.version}
-                {availableUpdate.pubDate ? ` - ${new Date(availableUpdate.pubDate).toLocaleDateString("fr-FR")}` : ""}
-              </div>
-            ) : null}
-
-            {availableUpdate?.notes ? <div className="mini-note">{availableUpdate.notes}</div> : null}
-            {updaterMessage ? <div className="status ok">{updaterMessage}</div> : null}
-            {updaterError ? <div className="status warn">{updaterError}</div> : null}
-
-            <div className="ticket-modal-actions">
-              <button className="ghost-btn" onClick={onCheckUpdates} disabled={checkingUpdates || installingUpdate}>
-                {checkingUpdates ? "Verification..." : "Verifier les mises a jour"}
-              </button>
-              <button
-                className="primary-btn"
-                onClick={onInstallUpdate}
-                disabled={!availableUpdate || checkingUpdates || installingUpdate}
-              >
-                {installingUpdate ? "Installation..." : "Installer la mise a jour"}
-              </button>
-            </div>
-          </div>
-        </article>
       </section>
     </>
   );
+}
+
+const patchNotesData: { version: string; date: string; notes: string[] }[] = [
+  {
+    version: "0.1.17",
+    date: "2026-04-14",
+    notes: [
+      "Mise a jour obligatoire : overlay bloquant si une MAJ est disponible",
+      "Verification automatique des mises a jour toutes les 5 minutes",
+      "Redemarrage automatique apres installation de la mise a jour",
+      "Nouvelle page Version avec patch notes et selecteur de version",
+      "Suppression du bandeau de mise a jour optionnel",
+    ],
+  },
+  {
+    version: "0.1.16",
+    date: "2025-06-01",
+    notes: [
+      "Ajout de la page Version avec patch notes",
+      "Synchronisation des abonnements entre utilisateurs",
+      "Correction du curseur collaboratif avec le scroll",
+      "Historique separe App / Google Sheets en deux colonnes",
+      "Validation du formulaire d ajout d abonnement",
+      "Effets hover/active sur les boutons modaux",
+    ],
+  },
+  {
+    version: "0.1.15",
+    date: "2025-05-25",
+    notes: [
+      "Systeme d abonnements dynamiques avec ajout/suppression",
+      "Modale d ajout et de suppression d abonnement",
+      "Toast et historique pour les actions abonnements",
+      "Signaux collaboratifs (ping, assist, celebrate, focus)",
+    ],
+  },
+  {
+    version: "0.1.14",
+    date: "2025-05-18",
+    notes: [
+      "Vue collaboration multi-utilisateurs en temps reel",
+      "Curseurs distants avec couleur personnalisee",
+      "Note partagee synchronisee entre pairs",
+      "Badges de presence et liste des collaborateurs",
+    ],
+  },
+  {
+    version: "0.1.13",
+    date: "2025-05-10",
+    notes: [
+      "Page Parametres avec profil et identite",
+      "Sauvegarde du profil dans Supabase",
+      "Choix de la couleur de curseur",
+      "Deconnexion et gestion de session",
+    ],
+  },
+  {
+    version: "0.1.12",
+    date: "2025-05-02",
+    notes: [
+      "Systeme de remboursements avec historique",
+      "Undo/Redo pour les remboursements",
+      "Export des tickets en CSV",
+      "Ameliorations du dashboard",
+    ],
+  },
+];
+
+function renderVersionPage(
+  updaterStatus: UpdaterStatus | null,
+  availableUpdate: AvailableUpdate | null,
+  checkingUpdates: boolean,
+  installingUpdate: boolean,
+  updaterMessage: string,
+  updaterError: string,
+  selectedPatchVersion: string,
+  setSelectedPatchVersion: (v: string) => void,
+  onCheckUpdates: () => void,
+  onInstallUpdate: () => void
+) {
+  const selectedPatch = patchNotesData.find((p) => p.version === selectedPatchVersion) || patchNotesData[0];
+  const currentVersion = updaterStatus?.currentVersion || "0.1.16";
+  const currentPatch = patchNotesData.find((p) => p.version === currentVersion);
+
+  return (
+    <>
+      <section className="topbar">
+        <div>
+          <span className="eyebrow">Version</span>
+          <h1>Mises a jour et patch notes</h1>
+          <p>Verifie les mises a jour disponibles et consulte l historique des versions.</p>
+        </div>
+        <div className="topbar-actions">
+          <button className="ghost-btn" onClick={onCheckUpdates} disabled={checkingUpdates || installingUpdate}>
+            {checkingUpdates ? "Verification..." : "Verifier"}
+          </button>
+        </div>
+      </section>
+
+      <section className="version-page-grid">
+        <div className="version-left">
+          <article className="panel">
+            <div className="panel-head">
+              <div>
+                <span className="panel-kicker">Installation</span>
+                <h2>Version actuelle</h2>
+              </div>
+            </div>
+            <div className="panel-body stack">
+              <div className="version-current-badge">
+                <span className="version-number">v{currentVersion}</span>
+                <span className={`version-config-pill ${updaterStatus?.configured ? "ok" : "warn"}`}>
+                  {updaterStatus?.configured ? "Updater actif" : "Updater non configure"}
+                </span>
+              </div>
+
+              {updaterStatus?.configured && (
+                <div className="version-endpoint-note">
+                  {updaterStatus.endpointCount} endpoint(s) configure(s)
+                </div>
+              )}
+
+              {availableUpdate ? (
+                <div className="status info">
+                  Nouvelle version disponible : v{availableUpdate.version}
+                  {availableUpdate.pubDate
+                    ? ` — ${new Date(availableUpdate.pubDate).toLocaleDateString("fr-FR")}`
+                    : ""}
+                </div>
+              ) : null}
+
+              {availableUpdate?.notes ? <div className="mini-note">{availableUpdate.notes}</div> : null}
+              {updaterMessage ? <div className="status ok">{updaterMessage}</div> : null}
+              {updaterError ? <div className="status warn">{updaterError}</div> : null}
+
+              <div className="ticket-modal-actions">
+                <button className="ghost-btn" onClick={onCheckUpdates} disabled={checkingUpdates || installingUpdate}>
+                  {checkingUpdates ? "Verification..." : "Verifier les mises a jour"}
+                </button>
+                <button
+                  className="primary-btn"
+                  onClick={onInstallUpdate}
+                  disabled={!availableUpdate || checkingUpdates || installingUpdate}
+                >
+                  {installingUpdate ? "Installation..." : "Installer la mise a jour"}
+                </button>
+              </div>
+            </div>
+          </article>
+
+          {currentPatch ? (
+            <article className="panel">
+              <div className="panel-head">
+                <div>
+                  <span className="panel-kicker">Notes</span>
+                  <h2>Quoi de neuf en v{currentVersion}</h2>
+                </div>
+              </div>
+              <div className="panel-body">
+                <ul className="version-notes-list">
+                  {currentPatch.notes.map((note, i) => (
+                    <li key={i}>{note}</li>
+                  ))}
+                </ul>
+              </div>
+            </article>
+          ) : null}
+        </div>
+
+        <div className="version-right">
+          <article className="panel">
+            <div className="panel-head">
+              <div>
+                <span className="panel-kicker">Historique</span>
+                <h2>Patch notes</h2>
+              </div>
+            </div>
+            <div className="panel-body stack">
+              <select
+                className="version-select"
+                value={selectedPatchVersion}
+                onChange={(e) => setSelectedPatchVersion(e.target.value)}
+              >
+                {patchNotesData.map((p) => (
+                  <option key={p.version} value={p.version}>
+                    v{p.version} — {new Date(p.date).toLocaleDateString("fr-FR")}
+                  </option>
+                ))}
+              </select>
+
+              <div className="version-patch-detail">
+                <div className="version-patch-header">
+                  <span className="version-number">v{selectedPatch.version}</span>
+                  <span className="version-patch-date">
+                    {new Date(selectedPatch.date).toLocaleDateString("fr-FR")}
+                  </span>
+                </div>
+                <ul className="version-notes-list">
+                  {selectedPatch.notes.map((note, i) => (
+                    <li key={i}>{note}</li>
+                  ))}
+                </ul>
+              </div>
+            </div>
+          </article>
+        </div>
+      </section>
+    </>
+  );
+}
+
+function cloneReimbursementForm(form: ReimbursementFormLine): ReimbursementFormLine {
+  return {
+    category: form.category,
+    amount: form.amount,
+  };
+}
+
+function findMatchingReimbursementEntry(
+  entries: ReimbursementDetailsEntry[],
+  target: ReimbursementDetailsEntry
+) {
+  return (
+    entries.find(
+      (entry) =>
+        entry.row === target.row &&
+        entry.category === target.category &&
+        Math.abs(entry.amount - target.amount) < 0.001
+    ) ||
+    entries.find(
+      (entry) =>
+        entry.category === target.category &&
+        Math.abs(entry.amount - target.amount) < 0.001
+    ) ||
+    null
+  );
+}
+
+function buildHistorySnapshot(params: {
+  page: PageKey;
+  selectedMonth: string;
+  ticketSearch: string;
+  ticketCategoryFilter: string;
+  ticketStatusFilter: TicketStatusFilter;
+  ticketSortMode: TicketSortMode;
+  reimbursementForm: ReimbursementFormLine;
+  sharedNote: string;
+}): HistorySnapshot {
+  return {
+    page: params.page,
+    selectedMonth: params.selectedMonth,
+    ticketSearch: params.ticketSearch,
+    ticketCategoryFilter: params.ticketCategoryFilter,
+    ticketStatusFilter: params.ticketStatusFilter,
+    ticketSortMode: params.ticketSortMode,
+    reimbursementForm: cloneReimbursementForm(params.reimbursementForm),
+    sharedNote: params.sharedNote,
+  };
+}
+
+function areSnapshotsEqual(a: HistorySnapshot, b: HistorySnapshot) {
+  return (
+    a.page === b.page &&
+    a.selectedMonth === b.selectedMonth &&
+    a.ticketSearch === b.ticketSearch &&
+    a.ticketCategoryFilter === b.ticketCategoryFilter &&
+    a.ticketStatusFilter === b.ticketStatusFilter &&
+    a.ticketSortMode === b.ticketSortMode &&
+    a.reimbursementForm.category === b.reimbursementForm.category &&
+    a.reimbursementForm.amount === b.reimbursementForm.amount &&
+    a.sharedNote === b.sharedNote
+  );
+}
+
+function describeHistorySnapshotChange(from: HistorySnapshot, to: HistorySnapshot) {
+  const changes: string[] = [];
+
+  if (from.page !== to.page) {
+    changes.push(`page ${pageMeta[to.page].title.toLowerCase()}`);
+  }
+
+  if (from.selectedMonth !== to.selectedMonth) {
+    changes.push(`mois ${getSelectedMonthLabel(to.selectedMonth).toLowerCase()}`);
+  }
+
+  if (from.ticketSearch !== to.ticketSearch) {
+    changes.push(to.ticketSearch ? `recherche "${to.ticketSearch}"` : "recherche effacee");
+  }
+
+  if (from.ticketCategoryFilter !== to.ticketCategoryFilter) {
+    changes.push(
+      to.ticketCategoryFilter === "all"
+        ? "categorie tous"
+        : `categorie ${to.ticketCategoryFilter.toLowerCase()}`
+    );
+  }
+
+  if (from.ticketStatusFilter !== to.ticketStatusFilter) {
+    const nextLabel =
+      to.ticketStatusFilter === "all"
+        ? "tous"
+        : to.ticketStatusFilter === "sent"
+          ? "envoyes"
+          : "non envoyes";
+    changes.push(`filtre ${nextLabel}`);
+  }
+
+  if (from.ticketSortMode !== to.ticketSortMode) {
+    const nextLabel =
+      to.ticketSortMode === "amount_desc"
+        ? "tri montant decroissant"
+        : to.ticketSortMode === "amount_asc"
+          ? "tri montant croissant"
+          : to.ticketSortMode === "date_asc"
+            ? "tri date croissante"
+            : "tri date decroissante";
+    changes.push(nextLabel);
+  }
+
+  if (from.reimbursementForm.category !== to.reimbursementForm.category) {
+    changes.push(`type remboursement ${to.reimbursementForm.category.toLowerCase()}`);
+  }
+
+  if (from.reimbursementForm.amount !== to.reimbursementForm.amount) {
+    changes.push(
+      to.reimbursementForm.amount
+        ? `montant remboursement ${to.reimbursementForm.amount}`
+        : "montant remboursement efface"
+    );
+  }
+
+  if (from.sharedNote !== to.sharedNote) {
+    changes.push(to.sharedNote.trim() ? "note collab restauree" : "note collab vide");
+  }
+
+  if (changes.length === 0) {
+    return "dernier etat local restaure";
+  }
+
+  if (changes.length === 1) {
+    return changes[0];
+  }
+
+  return `${changes[0]} et ${changes.length - 1} autre(s) changement(s)`;
+}
+
+function getLocalHistoryTitle(detail: string) {
+  const lowerDetail = detail.toLowerCase();
+
+  if (lowerDetail.includes("recherche")) {
+    return "Recherche modifiee";
+  }
+
+  if (lowerDetail.includes("categorie") || lowerDetail.includes("filtre")) {
+    return "Filtres modifies";
+  }
+
+  if (lowerDetail.includes("tri")) {
+    return "Tri modifie";
+  }
+
+  if (lowerDetail.includes("mois")) {
+    return "Mois change";
+  }
+
+  if (lowerDetail.includes("page")) {
+    return "Navigation modifiee";
+  }
+
+  if (lowerDetail.includes("note collab")) {
+    return "Note collab modifiee";
+  }
+
+  if (lowerDetail.includes("remboursement")) {
+    return "Saisie remboursement modifiee";
+  }
+
+  return "Modification locale";
+}
+
+function shouldHandleGlobalHistoryShortcut(target: EventTarget | null) {
+  const element = target instanceof HTMLElement ? target : null;
+
+  if (!element) {
+    return true;
+  }
+
+  if (element.closest('[data-history-global="true"]')) {
+    return true;
+  }
+
+  const tagName = element.tagName.toLowerCase();
+  const isEditableField =
+    element.isContentEditable ||
+    tagName === "input" ||
+    tagName === "textarea" ||
+    tagName === "select";
+
+  return !isEditableField;
 }
 
 function App() {
@@ -2397,6 +3817,13 @@ function App() {
     newPassword: "",
     confirmPassword: "",
   });
+  const [historyState, setHistoryState] = useState<HistoryState>({
+    past: [],
+    future: [],
+  });
+  const [historyEvents, setHistoryEvents] = useState<HistoryEvent[]>([]);
+  const [historyToasts, setHistoryToasts] = useState<HistoryEvent[]>([]);
+  const [historyPanelOpen, setHistoryPanelOpen] = useState(false);
   const [accountSettingsLoading, setAccountSettingsLoading] = useState(false);
   const [accountSettingsStatus, setAccountSettingsStatus] = useState("");
   const [accountSettingsError, setAccountSettingsError] = useState("");
@@ -2406,28 +3833,64 @@ function App() {
   const [installingUpdate, setInstallingUpdate] = useState(false);
   const [updaterMessage, setUpdaterMessage] = useState("");
   const [updaterError, setUpdaterError] = useState("");
-  const [dismissedUpdateVersion, setDismissedUpdateVersion] = useState("");
+  const [selectedPatchVersion, setSelectedPatchVersion] = useState("0.1.17");
   const [tickets, setTickets] = useState<Ticket[]>([]);
+  const [dashboardSubscriptions, setDashboardSubscriptions] = useState<DashboardSubscription[]>(() => {
+    try {
+      const raw = window.localStorage.getItem(dashboardSubscriptionsStorageKey);
+      return raw ? JSON.parse(raw) : [];
+    } catch {
+      return [];
+    }
+  });
+  const [subPanelOpen, setSubPanelOpen] = useState(false);
+  const [subDeletePanelOpen, setSubDeletePanelOpen] = useState(false);
+  const [subFormLabel, setSubFormLabel] = useState("");
+  const [subFormAmount, setSubFormAmount] = useState("");
+  const [subFormError, setSubFormError] = useState("");
+  const [ticketMonthSummary, setTicketMonthSummary] = useState<TicketMonthSummary | null>(null);
   const [loadingTickets, setLoadingTickets] = useState(true);
   const [refreshingTickets, setRefreshingTickets] = useState(false);
   const [ticketsError, setTicketsError] = useState("");
   const [lastTicketsSyncLabel, setLastTicketsSyncLabel] = useState("");
-  const [selectedMonth, setSelectedMonth] = useState("12");
+  const [selectedMonth, setSelectedMonth] = useState(getCurrentMonthValue);
   const [ticketSearch, setTicketSearch] = useState("");
   const [ticketCategoryFilter, setTicketCategoryFilter] = useState("all");
   const [ticketStatusFilter, setTicketStatusFilter] = useState<TicketStatusFilter>("all");
   const [ticketSortMode, setTicketSortMode] = useState<TicketSortMode>("date_desc");
   const [reloadSeed, setReloadSeed] = useState(0);
   const [isTicketModalOpen, setIsTicketModalOpen] = useState(false);
+  const [budgetDetailsOpen, setBudgetDetailsOpen] = useState(false);
+  const [budgetPreviewTicket, setBudgetPreviewTicket] = useState<Ticket | null>(null);
   const [submittingTicket, setSubmittingTicket] = useState(false);
   const [submitTicketError, setSubmitTicketError] = useState("");
+  const [reimbursementForm, setReimbursementForm] = useState<ReimbursementFormLine>(
+    createEmptyReimbursementLine
+  );
+  const [reimbursementDetails, setReimbursementDetails] = useState<ReimbursementDetails>({
+    entries: [],
+    ceTotal: 0,
+    medecinTotal: 0,
+    total: 0,
+  });
+  const [submittingReimbursements, setSubmittingReimbursements] = useState(false);
+  const [deletingReimbursementRow, setDeletingReimbursementRow] = useState<number | null>(null);
+  const [reimbursementStatus, setReimbursementStatus] = useState("");
+  const [reimbursementError, setReimbursementError] = useState("");
   const [voiceSupported, setVoiceSupported] = useState(false);
   const [voiceListening, setVoiceListening] = useState(false);
   const [voiceTranscript, setVoiceTranscript] = useState("");
   const [voiceStep, setVoiceStep] = useState<VoiceStep>("date");
   const [voiceFeedback, setVoiceFeedback] = useState("");
   const [collabIdentity, setCollabIdentity] = useState<CollabIdentity>(createCollabIdentity);
-  const [collaborators, setCollaborators] = useState<Collaborator[]>([]);
+  const [localCollaborators, setLocalCollaborators] = useState<Collaborator[]>([]);
+  const [remoteCollaborators, setRemoteCollaborators] = useState<Collaborator[]>([]);
+  const [collabFeed, setCollabFeed] = useState<CollabFeedItem[]>([]);
+  const [collabSignals, setCollabSignals] = useState<CollabSignal[]>([]);
+  const [followedPeerId, setFollowedPeerId] = useState("");
+  const [collabConnectionState, setCollabConnectionState] = useState<
+    "connecting" | "live" | "unstable"
+  >("connecting");
   const [sharedNote, setSharedNote] = useState(
     () =>
       (typeof window !== "undefined" &&
@@ -2446,16 +3909,32 @@ function App() {
   const shouldRestartRecognitionRef = useRef(false);
   const voiceStepRef = useRef<VoiceStep>("date");
   const collabChannelRef = useRef<BroadcastChannel | null>(null);
+  const collabIdentityRef = useRef<CollabIdentity>(createCollabIdentity());
   const pageRef = useRef<PageKey>(getInitialPage());
   const selectedMonthRef = useRef(selectedMonth);
   const ticketsRef = useRef<Ticket[]>([]);
   const lastLoadedMonthRef = useRef("");
   const collabNoteTimestampRef = useRef(0);
+  const sharedNoteRef = useRef(sharedNote);
+  const collabPointerStateRef = useRef<PointerState>({ x: 50, y: 50, visible: false });
+  const collabFocusRef = useRef({ key: "", label: "" });
   const lastPointerSentAtRef = useRef(0);
+  const mainScrollYRef = useRef(0);
+  const mainElRef = useRef<HTMLElement | null>(null);
+  const supabaseChannelRef = useRef<RealtimeChannel | null>(null);
+  const pushSupabasePresenceRef = useRef<((event?: "heartbeat" | "pointer" | "focus") => void) | null>(null);
+  const knownPeerIdsRef = useRef<Set<string>>(new Set());
   const startupUpdaterCheckedRef = useRef(false);
+  const historySnapshotRef = useRef<HistorySnapshot | null>(null);
+  const reimbursementUndoActionRef = useRef<ReimbursementRemoteHistoryAction | null>(null);
+  const reimbursementRedoActionRef = useRef<ReimbursementRemoteHistoryAction | null>(null);
   const deferredTicketSearch = useDeferredValue(ticketSearch);
   const isTauriRuntime =
     typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+  const collaborators = mergeCollaboratorLists(localCollaborators, remoteCollaborators);
+  const visibleRemoteCursors = collaborators.filter(
+    (peer) => peer.insideBoard && peer.page === page
+  );
   const ticketCategoryChoices = getTicketCategoryChoices(tickets);
   const visibleTickets = filterAndSortTickets(
     tickets,
@@ -2464,11 +3943,9 @@ function App() {
     ticketStatusFilter,
     ticketSortMode
   );
-  const showUpdateBanner = Boolean(
-    availableUpdate && dismissedUpdateVersion !== availableUpdate.version
-  );
+  const updateAvailable = Boolean(availableUpdate);
   const updateBannerDateLabel =
-    showUpdateBanner && availableUpdate?.pubDate
+    updateAvailable && availableUpdate?.pubDate
       ? new Date(availableUpdate.pubDate).toLocaleDateString("fr-FR")
       : "";
 
@@ -2488,6 +3965,24 @@ function App() {
   useEffect(() => {
     ticketsRef.current = tickets;
   }, [tickets]);
+
+  useEffect(() => {
+    collabIdentityRef.current = collabIdentity;
+  }, [collabIdentity]);
+
+  useEffect(() => {
+    sharedNoteRef.current = sharedNote;
+  }, [sharedNote]);
+
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      setCollabSignals((current) => pruneCollabSignals(current));
+    }, 900);
+
+    return () => {
+      window.clearInterval(interval);
+    };
+  }, []);
 
   useEffect(() => {
     if (!currentAccount) {
@@ -2540,6 +4035,383 @@ function App() {
   }, [selectedMonth]);
 
   useEffect(() => {
+    setBudgetPreviewTicket(null);
+    setBudgetDetailsOpen(false);
+  }, [selectedMonth]);
+
+  const captureCurrentSnapshot = (): HistorySnapshot =>
+    buildHistorySnapshot({
+      page,
+      selectedMonth,
+      ticketSearch,
+      ticketCategoryFilter,
+      ticketStatusFilter,
+      ticketSortMode,
+      reimbursementForm,
+      sharedNote,
+    });
+
+  const applyHistorySnapshot = (snapshot: HistorySnapshot) => {
+    setPage(snapshot.page);
+    setSelectedMonth(snapshot.selectedMonth);
+    setTicketSearch(snapshot.ticketSearch);
+    setTicketCategoryFilter(snapshot.ticketCategoryFilter);
+    setTicketStatusFilter(snapshot.ticketStatusFilter);
+    setTicketSortMode(snapshot.ticketSortMode);
+    setReimbursementForm(cloneReimbursementForm(snapshot.reimbursementForm));
+    setSharedNote(snapshot.sharedNote);
+
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(collabSharedNoteStorageKey, snapshot.sharedNote);
+    }
+
+    setReimbursementStatus("");
+    setReimbursementError("");
+  };
+
+  const pushHistorySnapshot = () => {
+    const snapshot = captureCurrentSnapshot();
+    const lastSnapshot = historySnapshotRef.current;
+
+    if (lastSnapshot && areSnapshotsEqual(lastSnapshot, snapshot)) {
+      return;
+    }
+
+    setHistoryState((current) => ({
+      past: [...current.past, snapshot],
+      future: [],
+    }));
+
+    historySnapshotRef.current = snapshot;
+  };
+
+  const pushHistoryEvent = (
+    event: Omit<HistoryEvent, "id" | "createdAt">,
+    options?: { broadcast?: boolean }
+  ) => {
+    const shouldBroadcast = options?.broadcast !== false;
+    const now = Date.now();
+
+    const fullEvent: HistoryEvent = {
+      id: `${now}-${Math.random().toString(36).slice(2, 8)}`,
+      ...event,
+      createdAt: now,
+    };
+
+    setHistoryEvents((current) => [fullEvent, ...current].slice(0, 40));
+    setHistoryToasts((current) => [fullEvent, ...current].slice(0, 5));
+
+    if (shouldBroadcast) {
+      const historyMessage = {
+        type: "history" as const,
+        user: collabIdentityRef.current,
+        event,
+        timestamp: now,
+      } satisfies CollabMessage;
+
+      collabChannelRef.current?.postMessage(historyMessage);
+
+      void supabaseChannelRef.current?.send({
+        type: "broadcast",
+        event: "history",
+        payload: {
+          id: collabIdentityRef.current.id,
+          name: collabIdentityRef.current.name,
+          color: collabIdentityRef.current.color,
+          seed: collabIdentityRef.current.seed,
+          historyEvent: event,
+          timestamp: now,
+        },
+      });
+    }
+  };
+
+  const handleUndo = async () => {
+    const remoteAction = reimbursementUndoActionRef.current;
+
+    if (remoteAction?.kind === "delete") {
+      try {
+        setReimbursementStatus("");
+        setReimbursementError("");
+
+        const response = await createReimbursementsInSheets(remoteAction.month, [
+          {
+            category: remoteAction.entry.category,
+            amount: String(remoteAction.entry.amount),
+            targetRow: remoteAction.entry.row,
+          },
+        ]);
+
+        const responseObject = response as {
+          success?: boolean;
+          error?: string;
+        };
+
+        if (responseObject?.success === false) {
+          throw new Error(
+            responseObject.error || "Restauration du remboursement refusee par Google Sheets."
+          );
+        }
+
+        reimbursementUndoActionRef.current = null;
+        reimbursementRedoActionRef.current = remoteAction;
+
+        setReimbursementStatus(
+          `Remboursement restaure dans ${getSelectedMonthLabel(remoteAction.month)}.`
+        );
+        pushHistoryEvent({
+          tone: "ok",
+          source: "sheet",
+          shortcut: "Ctrl+Z",
+          title: "Remboursement restaure",
+          detail: `${remoteAction.entry.category} • ${euro.format(remoteAction.entry.amount)} • H${remoteAction.entry.row} / I${remoteAction.entry.row} • ${getSelectedMonthLabel(remoteAction.month)}`,
+        });
+        setReloadSeed((value) => value + 1);
+        return;
+      } catch (error) {
+        const message = getErrorMessage(error);
+        setReimbursementError(message);
+        pushHistoryEvent({
+          tone: "warn",
+          source: "sheet",
+          shortcut: "Ctrl+Z",
+          title: "Retour arriere refuse",
+          detail: message,
+        });
+        return;
+      }
+    }
+
+    if (historyState.past.length === 0) {
+      return;
+    }
+
+    const previous = historyState.past[historyState.past.length - 1];
+    const currentSnapshot = captureCurrentSnapshot();
+    const summary = describeHistorySnapshotChange(currentSnapshot, previous);
+
+    applyHistorySnapshot(previous);
+    historySnapshotRef.current = previous;
+    setHistoryState({
+      past: historyState.past.slice(0, -1),
+      future: [currentSnapshot, ...historyState.future],
+    });
+    pushHistoryEvent({
+      tone: "info",
+      source: "app",
+      shortcut: "Ctrl+Z",
+      title: getLocalHistoryTitle(summary),
+      detail: summary,
+    });
+  };
+
+  const handleRedo = async () => {
+    const remoteAction = reimbursementRedoActionRef.current;
+
+    if (remoteAction?.kind === "delete") {
+      const entryToDelete = findMatchingReimbursementEntry(
+        reimbursementDetails.entries,
+        remoteAction.entry
+      );
+
+      if (!entryToDelete) {
+        setReimbursementError(
+          "Impossible de refaire la suppression : remboursement introuvable apres restauration."
+        );
+        return;
+      }
+
+      try {
+        setReimbursementStatus("");
+        setReimbursementError("");
+
+        const response = await deleteReimbursementInSheets(remoteAction.month, entryToDelete.row);
+        const responseObject = response as {
+          success?: boolean;
+          error?: string;
+        };
+
+        if (responseObject?.success === false) {
+          throw new Error(
+            responseObject.error || "Nouvelle suppression du remboursement refusee par Google Sheets."
+          );
+        }
+
+        reimbursementRedoActionRef.current = null;
+        reimbursementUndoActionRef.current = {
+          kind: "delete",
+          month: remoteAction.month,
+          entry: entryToDelete,
+        };
+
+        setReimbursementStatus(`Remboursement supprime de nouveau.`);
+        pushHistoryEvent({
+          tone: "ok",
+          source: "sheet",
+          shortcut: "Ctrl+Y",
+          title: "Remboursement supprime",
+          detail: `${entryToDelete.category} • ${euro.format(entryToDelete.amount)} • H${entryToDelete.row} / I${entryToDelete.row} • ${getSelectedMonthLabel(remoteAction.month)}`,
+        });
+        setReloadSeed((value) => value + 1);
+        return;
+      } catch (error) {
+        const message = getErrorMessage(error);
+        setReimbursementError(message);
+        pushHistoryEvent({
+          tone: "warn",
+          source: "sheet",
+          shortcut: "Ctrl+Y",
+          title: "Retour avant refuse",
+          detail: message,
+        });
+        return;
+      }
+    }
+
+    if (historyState.future.length === 0) {
+      return;
+    }
+
+    const next = historyState.future[0];
+    const currentSnapshot = captureCurrentSnapshot();
+    const summary = describeHistorySnapshotChange(currentSnapshot, next);
+
+    applyHistorySnapshot(next);
+    historySnapshotRef.current = next;
+    setHistoryState({
+      past: [...historyState.past, currentSnapshot],
+      future: historyState.future.slice(1),
+    });
+    pushHistoryEvent({
+      tone: "info",
+      source: "app",
+      shortcut: "Ctrl+Y",
+      title: getLocalHistoryTitle(summary),
+      detail: summary,
+    });
+  };
+
+  const canUndo =
+    historyState.past.length > 0 || reimbursementUndoActionRef.current !== null;
+  const canRedo =
+    historyState.future.length > 0 || reimbursementRedoActionRef.current !== null;
+
+   useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const key = event.key.toLowerCase();
+      const ctrlOrMeta = event.ctrlKey || event.metaKey;
+
+      const isUndo = ctrlOrMeta && !event.shiftKey && key === "z";
+      const isRedo =
+        (ctrlOrMeta && key === "y") ||
+        (ctrlOrMeta && event.shiftKey && key === "z");
+
+      if (!isUndo && !isRedo) {
+        return;
+      }
+
+      if (!shouldHandleGlobalHistoryShortcut(event.target)) {
+        return;
+      }
+
+      if (isUndo && !canUndo) {
+        return;
+      }
+
+      if (isRedo && !canRedo) {
+        return;
+      }
+
+      event.preventDefault();
+
+      if (isUndo) {
+        handleUndo();
+        return;
+      }
+
+      handleRedo();
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [canUndo, canRedo, handleUndo, handleRedo]);
+
+  useEffect(() => {
+    historySnapshotRef.current = captureCurrentSnapshot();
+  }, [
+    page,
+    selectedMonth,
+    ticketSearch,
+    ticketCategoryFilter,
+    ticketStatusFilter,
+    ticketSortMode,
+    reimbursementForm,
+    sharedNote,
+  ]);
+
+  const pushCollabFeed = (
+    id: string,
+    text: string,
+    tone: "info" | "ok" | "warn",
+    color: string,
+    createdAt = Date.now()
+  ) => {
+    setCollabFeed((current) =>
+      appendCollabFeedItem(current, buildCollabFeedItem(id, text, tone, color, createdAt))
+    );
+  };
+
+  const registerPeerSeen = (peer: Collaborator) => {
+    if (!knownPeerIdsRef.current.has(peer.id)) {
+      knownPeerIdsRef.current.add(peer.id);
+      pushCollabFeed(
+        `join:${peer.id}`,
+        `${peer.name} vient de rejoindre la collab.`,
+        "ok",
+        peer.color,
+        peer.lastSeen
+      );
+    }
+  };
+
+  const unregisterPeer = (peerId: string, fallbackName?: string, fallbackColor?: string) => {
+    if (!knownPeerIdsRef.current.has(peerId)) {
+      return;
+    }
+
+    knownPeerIdsRef.current.delete(peerId);
+    pushCollabFeed(
+      `leave:${peerId}:${Date.now()}`,
+      `${fallbackName || "Une session"} a quitte la collab.`,
+      "warn",
+      fallbackColor || collabColors[0]
+    );
+  };
+
+  const pushSignal = (
+    signalId: string,
+    kind: CollabSignalKind,
+    author: string,
+    color: string,
+    x: number,
+    y: number,
+    createdAt: number
+  ) => {
+    const signal = createCollabSignalBubble(signalId, kind, author, color, x, y, createdAt);
+    setCollabSignals((current) => appendCollabSignal(current, signal));
+    pushCollabFeed(
+      `signal:${signalId}`,
+      `${author} • ${signal.label}`,
+      collabSignalPresets[kind].tone,
+      color,
+      createdAt
+    );
+  };
+
+  useEffect(() => {
     if (typeof window === "undefined") {
       return;
     }
@@ -2568,7 +4440,8 @@ function App() {
       }
 
       if (message.type === "leave") {
-        setCollaborators((current) => current.filter((item) => item.id !== message.userId));
+        unregisterPeer(message.userId, "Une session");
+        setLocalCollaborators((current) => current.filter((item) => item.id !== message.userId));
         return;
       }
 
@@ -2581,65 +4454,140 @@ function App() {
         setSharedNote(message.note);
         window.localStorage.setItem(collabSharedNoteStorageKey, message.note);
         setCollabStatus(`${message.user.name} a mis a jour le bloc note partage.`);
+        pushCollabFeed(
+          `note:${message.user.id}:${message.timestamp}`,
+          `${message.user.name} a modifie le bloc-note partage.`,
+          "info",
+          message.user.color,
+          message.timestamp
+        );
+        registerPeerSeen({
+          ...message.user,
+          page: "collab",
+          context: "Bloc-note partage",
+          cursorX: 50,
+          cursorY: 50,
+          scrollY: 0,
+          insideBoard: false,
+          lastSeen: message.timestamp,
+          focusTicketKey: "",
+          focusTicketLabel: "",
+        });
+        return;
+      }
+
+      if (message.type === "signal") {
+        pushSignal(
+          message.signalId,
+          message.kind,
+          message.user.name,
+          message.user.color,
+          message.x,
+          message.y,
+          message.timestamp
+        );
+        return;
+      }
+
+      if (message.type === "history") {
+        pushHistoryEvent(
+          { ...message.event, author: message.user.name },
+          { broadcast: false }
+        );
+        return;
+      }
+
+      if (message.type === "subscriptions") {
+        setDashboardSubscriptions(message.subscriptions);
+        window.localStorage.setItem(
+          dashboardSubscriptionsStorageKey,
+          JSON.stringify(message.subscriptions)
+        );
         return;
       }
 
       if (message.type === "presence") {
-        setCollaborators((current) =>
-          upsertCollaboratorEntry(current, {
-            ...message.user,
-            page: message.page,
-            context: message.context,
-            cursorX: current.find((item) => item.id === message.user.id)?.cursorX ?? 50,
-            cursorY: current.find((item) => item.id === message.user.id)?.cursorY ?? 50,
-            insideBoard: current.find((item) => item.id === message.user.id)?.insideBoard ?? false,
-            lastSeen: message.timestamp,
-            focusTicketKey: current.find((item) => item.id === message.user.id)?.focusTicketKey ?? "",
-            focusTicketLabel: current.find((item) => item.id === message.user.id)?.focusTicketLabel ?? "",
-          })
+        setLocalCollaborators((current) =>
+          {
+            const peer = {
+              ...message.user,
+              page: message.page,
+              context: message.context,
+              cursorX: current.find((item) => item.id === message.user.id)?.cursorX ?? 50,
+              cursorY: current.find((item) => item.id === message.user.id)?.cursorY ?? 50,
+              scrollY: current.find((item) => item.id === message.user.id)?.scrollY ?? 0,
+              insideBoard: current.find((item) => item.id === message.user.id)?.insideBoard ?? false,
+              lastSeen: message.timestamp,
+              focusTicketKey: current.find((item) => item.id === message.user.id)?.focusTicketKey ?? "",
+              focusTicketLabel: current.find((item) => item.id === message.user.id)?.focusTicketLabel ?? "",
+            };
+            registerPeerSeen(peer);
+            return upsertCollaboratorEntry(current, peer);
+          }
         );
         return;
       }
 
       if (message.type === "pointer") {
-        setCollaborators((current) =>
-          upsertCollaboratorEntry(current, {
-            ...message.user,
-            page: message.page,
-            context: current.find((item) => item.id === message.user.id)?.context ?? "",
-            cursorX: message.x,
-            cursorY: message.y,
-            insideBoard: message.insideBoard,
-            lastSeen: message.timestamp,
-            focusTicketKey: current.find((item) => item.id === message.user.id)?.focusTicketKey ?? "",
-            focusTicketLabel: current.find((item) => item.id === message.user.id)?.focusTicketLabel ?? "",
-          })
+        setLocalCollaborators((current) =>
+          {
+            const peer = {
+              ...message.user,
+              page: message.page,
+              context: current.find((item) => item.id === message.user.id)?.context ?? "",
+              cursorX: message.x,
+              cursorY: message.y,
+              scrollY: message.scrollY ?? 0,
+              insideBoard: message.insideBoard,
+              lastSeen: message.timestamp,
+              focusTicketKey: current.find((item) => item.id === message.user.id)?.focusTicketKey ?? "",
+              focusTicketLabel: current.find((item) => item.id === message.user.id)?.focusTicketLabel ?? "",
+            };
+            registerPeerSeen(peer);
+            return upsertCollaboratorEntry(current, peer);
+          }
         );
         return;
       }
 
       if (message.type === "focus") {
-        setCollaborators((current) =>
-          upsertCollaboratorEntry(current, {
-            ...message.user,
-            page: message.page,
-            context: current.find((item) => item.id === message.user.id)?.context ?? "",
-            cursorX: current.find((item) => item.id === message.user.id)?.cursorX ?? 50,
-            cursorY: current.find((item) => item.id === message.user.id)?.cursorY ?? 50,
-            insideBoard: current.find((item) => item.id === message.user.id)?.insideBoard ?? false,
-            lastSeen: message.timestamp,
-            focusTicketKey: message.focusTicketKey,
-            focusTicketLabel: message.focusTicketLabel,
-          })
+        setLocalCollaborators((current) =>
+          {
+            const peer = {
+              ...message.user,
+              page: message.page,
+              context: current.find((item) => item.id === message.user.id)?.context ?? "",
+              cursorX: current.find((item) => item.id === message.user.id)?.cursorX ?? 50,
+              cursorY: current.find((item) => item.id === message.user.id)?.cursorY ?? 50,
+              scrollY: current.find((item) => item.id === message.user.id)?.scrollY ?? 0,
+              insideBoard: current.find((item) => item.id === message.user.id)?.insideBoard ?? false,
+              lastSeen: message.timestamp,
+              focusTicketKey: message.focusTicketKey,
+              focusTicketLabel: message.focusTicketLabel,
+            };
+            registerPeerSeen(peer);
+            if (message.focusTicketLabel) {
+              pushCollabFeed(
+                `focus:${message.user.id}:${message.timestamp}`,
+                `${message.user.name} regarde ${message.focusTicketLabel}.`,
+                "info",
+                message.user.color,
+                message.timestamp
+              );
+            }
+            return upsertCollaboratorEntry(current, peer);
+          }
         );
       }
     };
 
     const heartbeat = window.setInterval(() => {
       broadcastPresence();
-      setCollaborators((current) =>
-        current.filter((item) => Date.now() - item.lastSeen < collabPresenceTimeoutMs)
-      );
+      setLocalCollaborators((current) => {
+        const stale = current.filter((item) => Date.now() - item.lastSeen >= collabPresenceTimeoutMs);
+        stale.forEach((item) => unregisterPeer(item.id, item.name, item.color));
+        return current.filter((item) => Date.now() - item.lastSeen < collabPresenceTimeoutMs);
+      });
     }, 2500);
 
     const handleBeforeUnload = () => {
@@ -2665,9 +4613,295 @@ function App() {
   }, [collabIdentity]);
 
   useEffect(() => {
+    if (!currentAccount) {
+      setRemoteCollaborators([]);
+      setCollabError("");
+      setCollabConnectionState("connecting");
+      knownPeerIdsRef.current.clear();
+      pushSupabasePresenceRef.current = null;
+      return;
+    }
+
+    let active = true;
+    let subscribed = false;
+
+    const channel = supabase.channel(SUPABASE_COLLAB_CHANNEL, {
+      config: {
+        broadcast: {
+          self: false,
+        },
+      },
+    });
+
+    supabaseChannelRef.current = channel;
+
+    const publishPresence = (event: "heartbeat" | "pointer" | "focus" = "heartbeat") => {
+      if (!subscribed || !active) {
+        return;
+      }
+
+      const identity = collabIdentityRef.current;
+      const pointer = collabPointerStateRef.current;
+      const focus = collabFocusRef.current;
+
+      void channel
+        .send({
+          type: "broadcast",
+          event,
+          payload: buildSupabasePresencePayload(
+            identity,
+            pageRef.current,
+            selectedMonthRef.current,
+            pointer,
+            focus,
+            sharedNoteRef.current,
+            collabNoteTimestampRef.current
+          ),
+        })
+        .then(() => {
+          if (active) {
+            setCollabError("");
+          }
+        })
+        .catch((error) => {
+          if (active) {
+            setCollabError(getErrorMessage(error));
+          }
+        });
+    };
+
+    const applyRemotePayload = (payload: unknown) => {
+      if (!active) {
+        return;
+      }
+
+      const peer = normalizeRemoteCollaborator(payload);
+      if (!peer || peer.id === collabIdentityRef.current.id) {
+        return;
+      }
+
+      registerPeerSeen(peer);
+      setRemoteCollaborators((current) =>
+        pruneRemoteCollaborators(upsertCollaboratorEntry(current, peer))
+      );
+
+      if (!payload || typeof payload !== "object") {
+        return;
+      }
+
+      const row = payload as Record<string, unknown>;
+      const noteTimestamp = toNumber(row.sharedNoteUpdatedAt ?? row.timestamp ?? 0);
+      const noteText = String(row.sharedNoteText ?? row.note ?? "");
+      const author = String(row.sharedNoteUpdatedBy ?? row.name ?? "Une autre session");
+
+      if (noteText && noteTimestamp > collabNoteTimestampRef.current) {
+        collabNoteTimestampRef.current = noteTimestamp;
+        setSharedNote(noteText);
+
+        if (typeof window !== "undefined") {
+          window.localStorage.setItem(collabSharedNoteStorageKey, noteText);
+        }
+
+        if (author !== collabIdentityRef.current.name) {
+          setCollabStatus(`${author} a mis a jour le bloc note partage.`);
+          pushCollabFeed(
+            `note:${peer.id}:${noteTimestamp}`,
+            `${author} a mis a jour le bloc-note partage.`,
+            "info",
+            peer.color,
+            noteTimestamp
+          );
+        }
+      }
+    };
+
+    channel.on("broadcast", { event: "heartbeat" }, ({ payload }) => {
+      applyRemotePayload(payload);
+    });
+
+    channel.on("broadcast", { event: "pointer" }, ({ payload }) => {
+      applyRemotePayload(payload);
+    });
+
+    channel.on("broadcast", { event: "focus" }, ({ payload }) => {
+      applyRemotePayload(payload);
+    });
+
+    channel.on("broadcast", { event: "note" }, ({ payload }) => {
+      applyRemotePayload(payload);
+    });
+
+    channel.on("broadcast", { event: "signal" }, ({ payload }) => {
+      if (!payload || typeof payload !== "object") {
+        return;
+      }
+
+      const row = payload as Record<string, unknown>;
+      const id = String(row.signalId ?? "");
+      const kind = String(row.kind ?? "ping") as CollabSignalKind;
+      const author = String(row.name ?? "Une session");
+      const color = String(row.color ?? collabColors[0]);
+      const x = toNumber(row.x ?? row.cursorX ?? 50);
+      const y = toNumber(row.y ?? row.cursorY ?? 50);
+      const timestamp = toNumber(row.timestamp ?? Date.now());
+
+      if (!id) {
+        return;
+      }
+
+      pushSignal(id, kind, author, color, x, y, timestamp);
+    });
+
+    channel.on("broadcast", { event: "history" }, ({ payload }) => {
+      if (!payload || typeof payload !== "object") {
+        return;
+      }
+
+      const row = payload as Record<string, unknown>;
+      const senderId = String(row.id ?? "");
+      const senderName = String(row.name ?? "Une session");
+
+      if (!senderId || senderId === collabIdentityRef.current.id) {
+        return;
+      }
+
+      const rawEvent = row.historyEvent as Record<string, unknown> | undefined;
+      if (!rawEvent || typeof rawEvent !== "object") {
+        return;
+      }
+
+      pushHistoryEvent(
+        {
+          tone: (rawEvent.tone as HistoryEvent["tone"]) ?? "info",
+          source: (rawEvent.source as HistoryEvent["source"]) ?? "app",
+          title: String(rawEvent.title ?? "Action distante"),
+          detail: String(rawEvent.detail ?? ""),
+          shortcut: (rawEvent.shortcut as HistoryEvent["shortcut"]) ?? null,
+          author: senderName,
+        },
+        { broadcast: false }
+      );
+    });
+
+    channel.on("broadcast", { event: "leave" }, ({ payload }) => {
+      const row = payload && typeof payload === "object" ? (payload as Record<string, unknown>) : null;
+      const id = String(row?.id ?? "");
+      const name = String(row?.name ?? "Une session");
+      const color = String(row?.color ?? collabColors[0]);
+
+      if (!id) {
+        return;
+      }
+
+      unregisterPeer(id, name, color);
+      setRemoteCollaborators((current) => current.filter((item) => item.id !== id));
+    });
+
+    channel.on("broadcast", { event: "subscriptions" }, ({ payload }) => {
+      if (!payload || typeof payload !== "object") return;
+      const row = payload as Record<string, unknown>;
+      const senderId = String(row.id ?? "");
+      if (!senderId || senderId === collabIdentityRef.current.id) return;
+      const rawSubs = row.subscriptions;
+      if (!Array.isArray(rawSubs)) return;
+      const subs: DashboardSubscription[] = rawSubs
+        .filter((s: unknown) => s && typeof s === "object" && "id" in (s as Record<string, unknown>) && "label" in (s as Record<string, unknown>) && "amount" in (s as Record<string, unknown>))
+        .map((s: unknown) => {
+          const item = s as Record<string, unknown>;
+          return { id: String(item.id), label: String(item.label), amount: Number(item.amount) };
+        });
+      setDashboardSubscriptions(subs);
+      window.localStorage.setItem(dashboardSubscriptionsStorageKey, JSON.stringify(subs));
+    });
+
+    channel.subscribe((status) => {
+      if (!active) {
+        return;
+      }
+
+      if (status === "SUBSCRIBED") {
+        subscribed = true;
+        setCollabConnectionState("live");
+        setCollabStatus("Collab temps reel connectee.");
+        setCollabError("");
+        pushCollabFeed(
+          `realtime:${collabIdentityRef.current.id}:${Date.now()}`,
+          "Connexion live etablie. La collab est en temps reel.",
+          "ok",
+          collabIdentityRef.current.color
+        );
+        publishPresence("heartbeat");
+        return;
+      }
+
+      if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+        setCollabConnectionState("unstable");
+        setCollabError("Connexion temps reel instable. Verifie internet ou la config Supabase.");
+      }
+
+      if (status === "CLOSED") {
+        subscribed = false;
+        setCollabConnectionState("connecting");
+      }
+    });
+
+    pushSupabasePresenceRef.current = publishPresence;
+
+    const heartbeat = window.setInterval(() => {
+      publishPresence("heartbeat");
+      setRemoteCollaborators((current) => {
+        const next = pruneRemoteCollaborators(current);
+        current
+          .filter((item) => !next.some((candidate) => candidate.id === item.id))
+          .forEach((item) => unregisterPeer(item.id, item.name, item.color));
+        return next;
+      });
+    }, 1800);
+
+    return () => {
+      active = false;
+      subscribed = false;
+      window.clearInterval(heartbeat);
+      setRemoteCollaborators([]);
+      setCollabConnectionState("connecting");
+      pushSupabasePresenceRef.current = null;
+
+      void channel.send({
+        type: "broadcast",
+        event: "leave",
+        payload: {
+          id: collabIdentityRef.current.id,
+          name: collabIdentityRef.current.name,
+          color: collabIdentityRef.current.color,
+        },
+      }).catch(() => {});
+      void supabase.removeChannel(channel);
+
+      if (supabaseChannelRef.current === channel) {
+        supabaseChannelRef.current = null;
+      }
+    };
+  }, [currentAccount, collabIdentity.id]);
+
+  useEffect(() => {
+    if (!currentAccount) {
+      return;
+    }
+
+    pushSupabasePresenceRef.current?.("heartbeat");
+  }, [currentAccount, collabIdentity, page, selectedMonth]);
+
+  useEffect(() => {
     const loadTickets = async () => {
       if (!currentAccount) {
         setTickets([]);
+        setTicketMonthSummary(null);
+        setReimbursementDetails({
+          entries: [],
+          ceTotal: 0,
+          medecinTotal: 0,
+          total: 0,
+        });
         setLoadingTickets(false);
         setRefreshingTickets(false);
         return;
@@ -2687,7 +4921,21 @@ function App() {
 
         const data = await fetchTicketsFromSheets(selectedMonth);
         const normalized = normalizeTickets(data);
+        const normalizedSummary = normalizeTicketMonthSummary(data);
+        const normalizedReimbursements = normalizeReimbursementDetails(data);
         setTickets(normalized);
+        setTicketMonthSummary(
+          normalizedSummary ?? {
+            accountBalance: null,
+            currentRemaining: ticketsFinancePreset.monthlyIncome - normalized.reduce((sum, ticket) => sum + ticket.amount, 0),
+            theoreticalRemaining:
+              ticketsFinancePreset.monthlyIncome -
+              computeTicketBudgetLines(normalized).reduce((sum, line) => sum + line.planned, 0),
+            unexpectedSpendTotal: null,
+            source: "fallback",
+          }
+        );
+        setReimbursementDetails(normalizedReimbursements);
         lastLoadedMonthRef.current = selectedMonth;
         setLastTicketsSyncLabel(
           new Date().toLocaleTimeString("fr-FR", {
@@ -2701,6 +4949,13 @@ function App() {
         setTicketsError(getErrorMessage(error));
         if (!keepCurrentView) {
           setTickets([]);
+          setTicketMonthSummary(null);
+          setReimbursementDetails({
+            entries: [],
+            ceTotal: 0,
+            medecinTotal: 0,
+            total: 0,
+          });
         }
       } finally {
         setLoadingTickets(false);
@@ -2760,6 +5015,102 @@ function App() {
     };
   }, []);
 
+  const handleAddSubscription = () => {
+    const label = subFormLabel.trim();
+    const amount = parseFloat(subFormAmount.replace(",", "."));
+    if (!label && !subFormAmount.trim()) {
+      setSubFormError("Remplis le nom et le prix de l\u2019abonnement.");
+      return;
+    }
+    if (!label) {
+      setSubFormError("Le nom ne peut pas \u00eatre vide.");
+      return;
+    }
+    if (/\d/.test(label)) {
+      setSubFormError("Le nom ne doit pas contenir de chiffres.");
+      return;
+    }
+    if (!subFormAmount.trim()) {
+      setSubFormError("Indique un prix mensuel.");
+      return;
+    }
+    if (!Number.isFinite(amount) || amount <= 0) {
+      setSubFormError("Le prix doit \u00eatre un nombre valide (ex: 9,99).");
+      return;
+    }
+    setSubFormError("");
+    const next: DashboardSubscription = {
+      id: crypto.randomUUID(),
+      label,
+      amount,
+    };
+    setDashboardSubscriptions((prev) => {
+      const updated = [...prev, next];
+      window.localStorage.setItem(dashboardSubscriptionsStorageKey, JSON.stringify(updated));
+      return updated;
+    });
+    setSubFormLabel("");
+    setSubFormAmount("");
+    setSubPanelOpen(false);
+    pushHistoryEvent({
+      tone: "ok",
+      source: "app",
+      shortcut: null,
+      title: "Abonnement ajoute",
+      detail: `${label} • ${euro.format(amount)}/mois`,
+    });
+    // Broadcast updated list to other users
+    const updatedList = [...dashboardSubscriptions, next];
+    collabChannelRef.current?.postMessage({
+      type: "subscriptions",
+      user: collabIdentityRef.current,
+      subscriptions: updatedList,
+      timestamp: Date.now(),
+    } satisfies CollabMessage);
+    void supabaseChannelRef.current?.send({
+      type: "broadcast",
+      event: "subscriptions",
+      payload: {
+        id: collabIdentityRef.current.id,
+        subscriptions: updatedList,
+      },
+    });
+  };
+
+  const handleDeleteSubscription = (id: string) => {
+    const target = dashboardSubscriptions.find((s) => s.id === id);
+    setDashboardSubscriptions((prev) => {
+      const updated = prev.filter((s) => s.id !== id);
+      window.localStorage.setItem(dashboardSubscriptionsStorageKey, JSON.stringify(updated));
+      return updated;
+    });
+    if (target) {
+      pushHistoryEvent({
+        tone: "warn",
+        source: "app",
+        shortcut: null,
+        title: "Abonnement supprime",
+        detail: `${target.label} • ${euro.format(target.amount)}/mois`,
+      });
+    }
+    // Broadcast updated list to other users
+    const updatedList = dashboardSubscriptions.filter((s) => s.id !== id);
+    collabChannelRef.current?.postMessage({
+      type: "subscriptions",
+      user: collabIdentityRef.current,
+      subscriptions: updatedList,
+      timestamp: Date.now(),
+    } satisfies CollabMessage);
+    void supabaseChannelRef.current?.send({
+      type: "broadcast",
+      event: "subscriptions",
+      payload: {
+        id: collabIdentityRef.current.id,
+        subscriptions: updatedList,
+      },
+    });
+  };
+
   const handleOpenTicketModal = () => {
     setSubmitTicketError("");
     setNewTicketForm((current) => ({
@@ -2794,6 +5145,90 @@ function App() {
     setReloadSeed((value) => value + 1);
   };
 
+  const changePageWithHistory = (nextPage: PageKey) => {
+    if (nextPage === page) {
+      return;
+    }
+
+    pushHistorySnapshot();
+    setPage(nextPage);
+  };
+
+  const changeMonthWithHistory = (nextMonth: string) => {
+    if (nextMonth === selectedMonth) {
+      return;
+    }
+
+    pushHistorySnapshot();
+    setSelectedMonth(nextMonth);
+  };
+
+  const handleTicketSearchChange = (value: string) => {
+    if (value === ticketSearch) {
+      return;
+    }
+
+    pushHistorySnapshot();
+    setTicketSearch(value);
+  };
+
+  const handleTicketCategoryFilterChange = (value: string) => {
+    if (value === ticketCategoryFilter) {
+      return;
+    }
+
+    pushHistorySnapshot();
+    setTicketCategoryFilter(value);
+  };
+
+  const handleTicketStatusFilterChange = (value: TicketStatusFilter) => {
+    if (value === ticketStatusFilter) {
+      return;
+    }
+
+    pushHistorySnapshot();
+    setTicketStatusFilter(value);
+  };
+
+  const handleTicketSortModeChange = (value: TicketSortMode) => {
+    if (value === ticketSortMode) {
+      return;
+    }
+
+    pushHistorySnapshot();
+    setTicketSortMode(value);
+  };
+
+  const handleReimbursementFormChangeWithHistory = (
+    patch: Partial<ReimbursementFormLine>
+  ) => {
+    const nextForm = {
+      ...reimbursementForm,
+      ...patch,
+    };
+
+    if (
+      nextForm.category === reimbursementForm.category &&
+      nextForm.amount === reimbursementForm.amount
+    ) {
+      return;
+    }
+
+    pushHistorySnapshot();
+    setReimbursementForm(nextForm);
+    setReimbursementStatus("");
+    setReimbursementError("");
+  };
+
+  const handleSharedNoteChangeWithHistory = (value: string) => {
+    if (value === sharedNote) {
+      return;
+    }
+
+    pushHistorySnapshot();
+    handleSharedNoteChange(value);
+  };
+
   const handleSubmitTicket = async () => {
     if (!newTicketForm.date || !newTicketForm.amount || !newTicketForm.description.trim()) {
       setSubmitTicketError("Date, montant et description sont obligatoires.");
@@ -2821,6 +5256,86 @@ function App() {
       setSubmitTicketError(getErrorMessage(error));
     } finally {
       setSubmittingTicket(false);
+    }
+  };
+
+  const handleSubmitReimbursements = async () => {
+    if (!reimbursementForm.category.trim() || !reimbursementForm.amount.trim()) {
+      setReimbursementError("Choisis un type et indique un montant.");
+      return;
+    }
+
+    try {
+      setSubmittingReimbursements(true);
+      setReimbursementStatus("");
+      setReimbursementError("");
+
+      const response = await createReimbursementsInSheets(selectedMonth, [reimbursementForm]);
+      const responseObject = response as {
+        success?: boolean;
+        error?: string;
+        result?: { count?: number };
+      };
+
+      if (responseObject?.success === false) {
+        throw new Error(responseObject.error || "Ajout des remboursements refuse par Google Sheets.");
+      }
+
+      const count = Number(responseObject?.result?.count || 1);
+      setReimbursementForm(createEmptyReimbursementLine());
+      setReimbursementStatus(
+        `${count} remboursement(s) ajoute(s) dans ${getSelectedMonthLabel(selectedMonth)}.`
+      );
+      setReloadSeed((value) => value + 1);
+    } catch (error) {
+      setReimbursementError(getErrorMessage(error));
+    } finally {
+      setSubmittingReimbursements(false);
+    }
+  };
+
+  const handleDeleteReimbursement = async (row: number) => {
+    const entryToDelete = reimbursementDetails.entries.find((entry) => entry.row === row);
+
+    if (!entryToDelete) {
+      setReimbursementError("Remboursement introuvable dans le detail actuel.");
+      return;
+    }
+
+    try {
+      setDeletingReimbursementRow(row);
+      setReimbursementStatus("");
+      setReimbursementError("");
+
+      const response = await deleteReimbursementInSheets(selectedMonth, row);
+      const responseObject = response as { success?: boolean; error?: string };
+
+      if (responseObject?.success === false) {
+        throw new Error(
+          responseObject.error || "Suppression du remboursement refusee par Google Sheets."
+        );
+      }
+
+      reimbursementUndoActionRef.current = {
+        kind: "delete",
+        month: selectedMonth,
+        entry: entryToDelete,
+      };
+      reimbursementRedoActionRef.current = null;
+
+      setReimbursementStatus(`Remboursement H${row} / I${row} supprime.`);
+      pushHistoryEvent({
+        tone: "ok",
+        source: "sheet",
+        shortcut: null,
+        title: "Remboursement supprime",
+        detail: `${entryToDelete.category} • ${euro.format(entryToDelete.amount)} • H${row} / I${row} • ${getSelectedMonthLabel(selectedMonth)}`,
+      });
+      setReloadSeed((value) => value + 1);
+    } catch (error) {
+      setReimbursementError(getErrorMessage(error));
+    } finally {
+      setDeletingReimbursementRow(null);
     }
   };
 
@@ -2901,6 +5416,13 @@ function App() {
   const handleLogout = () => {
     persistSessionAccount(null);
     setCurrentAccount(null);
+    setLocalCollaborators([]);
+    setRemoteCollaborators([]);
+    setCollabFeed([]);
+    setCollabSignals([]);
+    setFollowedPeerId("");
+    setCollabConnectionState("connecting");
+    knownPeerIdsRef.current.clear();
     setAuthMode("signin");
     setAuthError("");
     setAuthStatus("");
@@ -3015,6 +5537,12 @@ function App() {
 
     startupUpdaterCheckedRef.current = true;
     void runUpdaterCheck({ silent: true });
+
+    const pollInterval = setInterval(() => {
+      void runUpdaterCheck({ silent: true });
+    }, 5 * 60 * 1000);
+
+    return () => clearInterval(pollInterval);
   }, [currentAccount, isTauriRuntime]);
 
   const handleCheckUpdates = async () => {
@@ -3042,7 +5570,6 @@ function App() {
         "Mise a jour telechargee et installee. Sur Windows, l app peut se fermer pour terminer l installation."
       );
       setAvailableUpdate(null);
-      setDismissedUpdateVersion("");
     } catch (error) {
       setUpdaterError(getErrorMessage(error));
     } finally {
@@ -3133,7 +5660,7 @@ function App() {
       shouldRestartRecognitionRef.current = false;
       recognitionRef.current.stop();
       setVoiceListening(false);
-      setVoiceFeedback("Dictée arretee.");
+      setVoiceFeedback("Dictée arrêtée.");
       return;
     }
 
@@ -3224,9 +5751,41 @@ function App() {
       note: value,
       timestamp: collabNoteTimestampRef.current,
     } satisfies CollabMessage);
+
+    void supabaseChannelRef.current?.send({
+      type: "broadcast",
+      event: "note",
+      payload: {
+        id: collabIdentityRef.current.id,
+        seed: collabIdentityRef.current.seed,
+        name: collabIdentityRef.current.name,
+        color: collabIdentityRef.current.color,
+        note: value,
+        timestamp: collabNoteTimestampRef.current,
+      },
+    });
+
+    pushSupabasePresenceRef.current?.("heartbeat");
+  };
+
+  const handleClearSharedNote = () => {
+    if (!sharedNote) {
+      return;
+    }
+
+    pushHistorySnapshot();
+    handleSharedNoteChange("");
+
+    pushCollabFeed(
+      `note-clear:${Date.now()}`,
+      `${collabIdentityRef.current.name} a vide le bloc-note partage.`,
+      "warn",
+      collabIdentityRef.current.color
+    );
   };
 
   const broadcastTicketFocus = (focusTicketKey: string, focusTicketLabel: string) => {
+    collabFocusRef.current = { key: focusTicketKey, label: focusTicketLabel };
     collabChannelRef.current?.postMessage({
       type: "focus",
       user: collabIdentity,
@@ -3235,9 +5794,57 @@ function App() {
       focusTicketLabel,
       timestamp: Date.now(),
     } satisfies CollabMessage);
+
+    pushSupabasePresenceRef.current?.("focus");
+  };
+
+  const handleSendCollabSignal = (kind: CollabSignalKind) => {
+    const signalId =
+      typeof crypto !== "undefined" && "randomUUID" in crypto
+        ? crypto.randomUUID()
+        : `${collabIdentityRef.current.id}-${Date.now()}`;
+    const pointer = collabPointerStateRef.current;
+    const x = pointer.visible ? pointer.x : 68;
+    const y = pointer.visible ? pointer.y : 28;
+    const timestamp = Date.now();
+
+    pushSignal(
+      signalId,
+      kind,
+      collabIdentityRef.current.name,
+      collabIdentityRef.current.color,
+      x,
+      y,
+      timestamp
+    );
+
+    collabChannelRef.current?.postMessage({
+      type: "signal",
+      user: collabIdentity,
+      signalId,
+      kind,
+      x,
+      y,
+      timestamp,
+    } satisfies CollabMessage);
+
+    void supabaseChannelRef.current?.send({
+      type: "broadcast",
+      event: "signal",
+      payload: {
+        signalId,
+        kind,
+        name: collabIdentityRef.current.name,
+        color: collabIdentityRef.current.color,
+        x,
+        y,
+        timestamp,
+      },
+    });
   };
 
   const handleTicketHover = (ticket: Ticket) => {
+    setBudgetPreviewTicket(ticket);
     broadcastTicketFocus(
       getTicketKey(ticket),
       `${ticket.description || "Sans description"} • ${ticket.date || "Sans date"}`
@@ -3245,6 +5852,7 @@ function App() {
   };
 
   const handleTicketLeave = () => {
+    setBudgetPreviewTicket(null);
     broadcastTicketFocus("", "");
   };
 
@@ -3275,7 +5883,7 @@ function App() {
 
       setCollabStatus("Session 2 ouverte dans une nouvelle fenetre.");
       return;
-    }
+    }0
 
     try {
       const label = `collab-${instanceSeed}`;
@@ -3302,26 +5910,77 @@ function App() {
     }
   };
 
-  const broadcastPointer = (x: number, y: number, insideBoard: boolean) => {
+  const broadcastPointer = (x: number, y: number, visible: boolean, scrollY = 0) => {
+    collabPointerStateRef.current = { x, y, visible };
+
     collabChannelRef.current?.postMessage({
       type: "pointer",
       user: collabIdentity,
-      page: "collab",
+      page: pageRef.current,
       x,
       y,
-      insideBoard,
+      scrollY,
+      insideBoard: visible,
       timestamp: Date.now(),
     } satisfies CollabMessage);
+
+    void supabaseChannelRef.current?.send({
+      type: "broadcast",
+      event: "pointer",
+      payload: {
+        id: collabIdentityRef.current.id,
+        seed: collabIdentityRef.current.seed,
+        name: collabIdentityRef.current.name,
+        color: collabIdentityRef.current.color,
+        page: pageRef.current,
+        context: getPresenceContext(pageRef.current, selectedMonthRef.current),
+        cursorX: x,
+        cursorY: y,
+        scrollY,
+        insideBoard: visible,
+        lastSeen: Date.now(),
+        focusTicketKey: collabFocusRef.current.key,
+        focusTicketLabel: collabFocusRef.current.label,
+      },
+    });
+
+    if (!visible) {
+      pushSupabasePresenceRef.current?.("heartbeat");
+    }
   };
 
-  const handleCollabBoardPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
-    const rect = event.currentTarget.getBoundingClientRect();
-    if (rect.width === 0 || rect.height === 0) {
+    const handleCollabBoardPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+      const rect = event.currentTarget.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) {
+        return;
+      }
+
+      const x = Math.max(0, Math.min(100, ((event.clientX - rect.left) / rect.width) * 100));
+      const y = Math.max(0, Math.min(100, ((event.clientY - rect.top) / rect.height) * 100));
+      const now = Date.now();
+
+      if (now - lastPointerSentAtRef.current < 24) {
+        return;
+      }
+
+      lastPointerSentAtRef.current = now;
+      broadcastPointer(x, y, true);
+    };
+
+    const handleCollabBoardPointerLeave = () => {
+      broadcastPointer(50, 50, false);
+    };
+
+    const handleGlobalPointerMove = (event: ReactPointerEvent<HTMLElement>) => {
+    const viewportWidth = window.innerWidth;
+    const viewportHeight = window.innerHeight;
+
+    if (viewportWidth === 0 || viewportHeight === 0) {
       return;
     }
 
-    const x = Math.max(0, Math.min(100, ((event.clientX - rect.left) / rect.width) * 100));
-    const y = Math.max(0, Math.min(100, ((event.clientY - rect.top) / rect.height) * 100));
+    const x = Math.max(0, Math.min(100, (event.clientX / viewportWidth) * 100));
+    const y = Math.max(0, Math.min(100, (event.clientY / viewportHeight) * 100));
     const now = Date.now();
 
     if (now - lastPointerSentAtRef.current < 24) {
@@ -3329,12 +5988,13 @@ function App() {
     }
 
     lastPointerSentAtRef.current = now;
-    broadcastPointer(x, y, true);
+    broadcastPointer(x, y, true, mainScrollYRef.current);
   };
 
-  const handleCollabBoardPointerLeave = () => {
+  const handleGlobalPointerLeave = () => {
     broadcastPointer(50, 50, false);
   };
+
 
   if (!currentAccount) {
     return renderAuthScreen(
@@ -3372,10 +6032,121 @@ function App() {
     { key: "subscriptions", label: "Abonnements", badge: "6" },
     { key: "collab", label: "Collab", badge: String(collaborators.length + 1) },
     { key: "settings", label: "Parametres" },
+    { key: "version", label: "Version" },
   ];
 
+  const historyModal =
+    historyPanelOpen && typeof document !== "undefined"
+      ? createPortal(
+          <div
+            className="modal-backdrop history-backdrop"
+            onClick={() => setHistoryPanelOpen(false)}
+          >
+            <div
+              className="budget-modal history-modal"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="budget-modal-head">
+                <div>
+                  <span className="eyebrow">Historique</span>
+                  <h2>Actions appliquees</h2>
+                  <p>
+                    Heure, raccourci, action et resultat. Seulement les vraies actions appliquees.
+                  </p>
+                </div>
+
+                <button
+                  type="button"
+                  className="modal-close"
+                  onClick={() => setHistoryPanelOpen(false)}
+                >
+                  Fermer
+                </button>
+              </div>
+
+              <div className="history-log-columns">
+                {(() => {
+                  const appEvents = historyEvents.filter((e) => e.source === "app");
+                  const sheetEvents = historyEvents.filter((e) => e.source === "sheet");
+                  return (
+                    <>
+                      <div className="history-log-col">
+                        <div className="history-log-section-label history-log-section-sheet">Google Sheets</div>
+                        {sheetEvents.length > 0 ? (
+                          <div className="history-log-list">
+                            {sheetEvents.map((eventItem) => (
+                              <div key={eventItem.id} className={`history-log-row ${eventItem.tone}`}>
+                                <div className="history-log-time">
+                                  {new Date(eventItem.createdAt).toLocaleTimeString("fr-FR")}
+                                </div>
+                                <div className="history-log-main">
+                                  <div className="history-log-head">
+                                    <div className="history-log-title-wrap">
+                                      {eventItem.author ? (
+                                        <span className="history-log-author">{eventItem.author}</span>
+                                      ) : null}
+                                      {eventItem.shortcut ? (
+                                        <span className="history-log-shortcut">{eventItem.shortcut}</span>
+                                      ) : null}
+                                      <strong>{eventItem.title}</strong>
+                                    </div>
+                                  </div>
+                                  <p>{eventItem.detail}</p>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="history-log-empty-col">Aucune action Google Sheets.</div>
+                        )}
+                      </div>
+
+                      <div className="history-log-col">
+                        <div className="history-log-section-label history-log-section-app">App</div>
+                        {appEvents.length > 0 ? (
+                          <div className="history-log-list">
+                            {appEvents.map((eventItem) => (
+                              <div key={eventItem.id} className={`history-log-row ${eventItem.tone}`}>
+                                <div className="history-log-time">
+                                  {new Date(eventItem.createdAt).toLocaleTimeString("fr-FR")}
+                                </div>
+                                <div className="history-log-main">
+                                  <div className="history-log-head">
+                                    <div className="history-log-title-wrap">
+                                      {eventItem.author ? (
+                                        <span className="history-log-author">{eventItem.author}</span>
+                                      ) : null}
+                                      {eventItem.shortcut ? (
+                                        <span className="history-log-shortcut">{eventItem.shortcut}</span>
+                                      ) : null}
+                                      <strong>{eventItem.title}</strong>
+                                    </div>
+                                  </div>
+                                  <p>{eventItem.detail}</p>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="history-log-empty-col">Aucune action locale.</div>
+                        )}
+                      </div>
+                    </>
+                  );
+                })()}
+              </div>
+            </div>
+          </div>,
+          document.body
+        )
+      : null;
+
   return (
-    <div className="app-shell">
+    <div
+      className="app-shell"
+      onPointerMove={handleGlobalPointerMove}
+      onPointerLeave={handleGlobalPointerLeave}
+    >
       <aside className="sidebar">
         <div className="sidebar-inner">
           <div className="brand">
@@ -3395,7 +6166,7 @@ function App() {
                 <button
                   key={item.key}
                   className={`nav-item ${page === item.key ? "active" : ""}`}
-                  onClick={() => setPage(item.key)}
+                  onClick={() => changePageWithHistory(item.key)}
                 >
                   <span>{item.label}</span>
                   {item.badge ? <span className="nav-badge">{item.badge}</span> : null}
@@ -3419,39 +6190,108 @@ function App() {
         </div>
       </aside>
 
-      <main className="main">
-        {showUpdateBanner && availableUpdate ? (
-          <section className="update-banner">
-            <div className="update-banner-copy">
-              <span className="eyebrow">Mise a jour disponible</span>
-              <h2>Version {availableUpdate.version} prete a etre installee</h2>
-              <p>
-                {availableUpdate.notes?.trim() ||
-                  "Une nouvelle version de Budget PC est disponible pour toi et les autres postes installes."}
-              </p>
-              {updateBannerDateLabel ? (
-                <span className="update-banner-meta">Publiee le {updateBannerDateLabel}</span>
-              ) : null}
-            </div>
+      <main className="main" ref={mainElRef} onScroll={(e) => { mainScrollYRef.current = (e.target as HTMLElement).scrollTop; }}>
 
-            <div className="update-banner-actions">
-              {checkingUpdates ? <span className="sync-badge">Synchro...</span> : null}
+        <div className="history-toolbar">
+          <div className="history-toolbar-actions">
+            <button
+              type="button"
+              className="ghost-btn history-btn"
+              onClick={handleUndo}
+              disabled={!canUndo}
+              aria-label="Retour en arriere"
+              title="Retour en arriere (Ctrl+Z)"
+            >
+              <svg className="history-btn-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
+            </button>
+
+            <button
+              type="button"
+              className="ghost-btn history-btn"
+              onClick={handleRedo}
+              disabled={!canRedo}
+              aria-label="Retour en avant"
+              title="Retour en avant (Ctrl+Y)"
+            >
+              <svg className="history-btn-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 18l6-6-6-6"/></svg>
+            </button>
+
+            <button
+              type="button"
+              className="ghost-btn history-log-btn"
+              onClick={() => setHistoryPanelOpen(true)}
+              title="Historique des actions appliquees"
+            >
+              Historique
+            </button>
+          </div>
+        </div>
+  
+        <div className="global-cursor-layer">
+          {visibleRemoteCursors.map((peer) => {
+            const scrollDelta = peer.scrollY - mainScrollYRef.current;
+            const viewportH = window.innerHeight;
+            const offsetPx = viewportH > 0 ? (scrollDelta / viewportH) * 100 : 0;
+            return (
+              <div
+                className="remote-cursor global"
+                key={`global-${peer.id}`}
+                style={{
+                  left: `${peer.cursorX}%`,
+                  top: `calc(${peer.cursorY}% + ${offsetPx}vh)`,
+                }}
+              >
+                <div className="remote-cursor-pin" style={{ backgroundColor: peer.color }} />
+                <div className="remote-cursor-tag" style={{ borderColor: peer.color }}>
+                  <span className="collab-dot" style={{ backgroundColor: peer.color }} />
+                  <strong>{peer.name}</strong>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        {updateAvailable && availableUpdate ? (
+          <div className="update-blocker-overlay">
+            <div className="update-blocker-card">
+              <div className="update-blocker-badge">MAJ DISPO</div>
+              <h1 className="update-blocker-title">Mise a jour requise</h1>
+              <p className="update-blocker-subtitle">
+                Une nouvelle version de Budget PC est disponible. Veuillez mettre a jour pour continuer.
+              </p>
+
+              <div className="update-blocker-version-row">
+                <span className="update-blocker-version-old">v{availableUpdate.currentVersion}</span>
+                <span className="update-blocker-arrow">→</span>
+                <span className="update-blocker-version-new">v{availableUpdate.version}</span>
+              </div>
+
+              {updateBannerDateLabel ? (
+                <span className="update-blocker-date">Publiee le {updateBannerDateLabel}</span>
+              ) : null}
+
+              {availableUpdate.notes ? (
+                <div className="update-blocker-notes">
+                  <span className="update-blocker-notes-title">Patch notes</span>
+                  <div className="update-blocker-notes-body">{availableUpdate.notes}</div>
+                </div>
+              ) : null}
+
               <button
-                className="ghost-btn"
-                onClick={() => setDismissedUpdateVersion(availableUpdate.version)}
+                className="update-blocker-btn"
+                onClick={handleInstallUpdate}
                 disabled={installingUpdate}
               >
-                Plus tard
+                {installingUpdate ? "Installation en cours..." : "Mettre a jour"}
               </button>
-              <button
-                className="primary-btn"
-                onClick={handleInstallUpdate}
-                disabled={checkingUpdates || installingUpdate}
-              >
-                {installingUpdate ? "Installation..." : "Installer la MAJ"}
-              </button>
+
+              {installingUpdate ? (
+                <p className="update-blocker-installing">Telechargement et installation... L app va redemarrer automatiquement.</p>
+              ) : null}
+              {updaterError ? (
+                <p className="update-blocker-error">{updaterError}</p>
+              ) : null}
             </div>
-          </section>
+          </div>
         ) : null}
 
         {page === "dashboard" &&
@@ -3462,18 +6302,40 @@ function App() {
             ticketsError,
             selectedMonth,
             lastTicketsSyncLabel,
-            setSelectedMonth,
+            reimbursementDetails.total,
+            dashboardSubscriptions,
+            subPanelOpen,
+            subFormLabel,
+            subFormAmount,
+            subFormError,
+            changeMonthWithHistory,
             handleRefreshTickets,
-            handleOpenTicketModal
+            handleOpenTicketModal,
+            () => { setSubFormError(""); setSubPanelOpen((v) => !v); },
+            () => setSubDeletePanelOpen((v) => !v),
+            setSubFormLabel,
+            setSubFormAmount,
+            handleAddSubscription,
+            handleDeleteSubscription,
+            subDeletePanelOpen
           )}
         {page === "tickets" &&
           renderTickets(
             visibleTickets,
+            ticketMonthSummary,
             tickets.length,
             loadingTickets,
             refreshingTickets,
             ticketsError,
             collaborators,
+            budgetPreviewTicket,
+            budgetDetailsOpen,
+            reimbursementForm,
+            reimbursementDetails,
+            submittingReimbursements,
+            deletingReimbursementRow,
+            reimbursementStatus,
+            reimbursementError,
             selectedMonth,
             lastTicketsSyncLabel,
             ticketSearch,
@@ -3481,13 +6343,17 @@ function App() {
             ticketCategoryFilter,
             ticketStatusFilter,
             ticketSortMode,
-            setSelectedMonth,
+            changeMonthWithHistory,
             handleRefreshTickets,
-            setTicketSearch,
-            setTicketCategoryFilter,
-            setTicketStatusFilter,
-            setTicketSortMode,
+            handleTicketSearchChange,
+            handleTicketCategoryFilterChange,
+            handleTicketStatusFilterChange,
+            handleTicketSortModeChange,
             handleOpenTicketModal,
+            () => setBudgetDetailsOpen(false),
+            handleReimbursementFormChangeWithHistory,
+            handleSubmitReimbursements,
+            handleDeleteReimbursement,
             handleTicketHover,
             handleTicketLeave
           )}
@@ -3498,11 +6364,18 @@ function App() {
             sharedNote,
             collabStatus,
             collabError,
+            collabFeed,
+            collabSignals,
+            followedPeerId,
+            collabConnectionState,
             handleCollabNameChange,
-            handleSharedNoteChange,
+            handleSharedNoteChangeWithHistory,
             handleOpenSecondSession,
             handleCollabBoardPointerMove,
-            handleCollabBoardPointerLeave
+            handleCollabBoardPointerLeave,
+            handleSendCollabSignal,
+            handleClearSharedNote,
+            setFollowedPeerId
           )}
         {page === "settings" &&
           renderSettings(
@@ -3511,24 +6384,61 @@ function App() {
             accountSettingsLoading,
             accountSettingsStatus,
             accountSettingsError,
-            updaterStatus,
-            availableUpdate,
-            checkingUpdates,
-            installingUpdate,
-            updaterMessage,
-            updaterError,
             (patch) => {
               setAccountSettingsForm((current) => ({ ...current, ...patch }));
               setAccountSettingsError("");
               setAccountSettingsStatus("");
             },
             handleSaveAccountSettings,
-            handleCheckUpdates,
-            handleInstallUpdate,
             handleLogout
           )}
-        {!["dashboard", "tickets", "collab", "settings"].includes(page) && renderPlaceholder(page)}
+        {page === "version" &&
+          renderVersionPage(
+            updaterStatus,
+            availableUpdate,
+            checkingUpdates,
+            installingUpdate,
+            updaterMessage,
+            updaterError,
+            selectedPatchVersion,
+            setSelectedPatchVersion,
+            handleCheckUpdates,
+            handleInstallUpdate
+          )}
+        {!["dashboard", "tickets", "collab", "settings", "version"].includes(page) && renderPlaceholder(page)}
+
       </main>
+      {historyModal}
+
+      {historyToasts.length > 0 ? (
+        <div className="history-toast-stack">
+          {historyToasts.map((toast) => (
+            <div key={toast.id} className={`history-toast history-toast-${toast.tone}`}>
+              <div className="history-toast-content">
+                <div className="history-toast-head">
+                  {toast.author ? (
+                    <span className="history-toast-author">{toast.author}</span>
+                  ) : null}
+                  {toast.shortcut ? (
+                    <span className="history-toast-shortcut">{toast.shortcut}</span>
+                  ) : null}
+                  <strong>{toast.title}</strong>
+                </div>
+                <p>{toast.detail}</p>
+              </div>
+              <button
+                type="button"
+                className="history-toast-close"
+                onClick={() => setHistoryToasts((current) => current.filter((item) => item.id !== toast.id))}
+                aria-label="Fermer"
+              >
+                ✕
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : null}
+
       {isTicketModalOpen &&
         renderTicketModal(
           newTicketForm,
