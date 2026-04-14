@@ -1842,7 +1842,7 @@ function renderDashboard(
   const monthlyTotal = tickets.reduce((sum, ticket) => sum + ticket.amount, 0);
   const sentCount = tickets.filter((ticket) => ticket.sent).length;
   const pendingCount = tickets.length - sentCount;
-  const recentTickets = tickets.slice(0, 6);
+  const recentTickets = tickets.slice(-6).reverse();
   const isBusy = loading || refreshing;
 
   const monthlyIncome = ticketsFinancePreset.monthlyIncome;
@@ -3392,6 +3392,13 @@ function renderSettings(
 
 const patchNotesData: { version: string; date: string; notes: string[] }[] = [
   {
+    version: "0.1.18",
+    date: "2026-04-14",
+    notes: [
+      "Correction de l ordre des derniers tickets sur le dashboard (les plus recents en premier)",
+    ],
+  },
+  {
     version: "0.1.17",
     date: "2026-04-14",
     notes: [
@@ -3833,7 +3840,7 @@ function App() {
   const [installingUpdate, setInstallingUpdate] = useState(false);
   const [updaterMessage, setUpdaterMessage] = useState("");
   const [updaterError, setUpdaterError] = useState("");
-  const [selectedPatchVersion, setSelectedPatchVersion] = useState("0.1.17");
+  const [selectedPatchVersion, setSelectedPatchVersion] = useState("0.1.18");
   const [tickets, setTickets] = useState<Ticket[]>([]);
   const [dashboardSubscriptions, setDashboardSubscriptions] = useState<DashboardSubscription[]>(() => {
     try {
