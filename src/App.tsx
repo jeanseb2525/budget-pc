@@ -20,7 +20,8 @@ type PageKey =
   | "subscriptions"
   | "collab"
   | "settings"
-  | "version";
+  | "version"
+  | "admin";
 
 type Ticket = {
   date: string;
@@ -114,9 +115,12 @@ type AccountProfile = {
   email: string;
   firstName: string;
   lastName: string;
+  pseudo: string;
   cursorColor: string;
   createdAt: string;
   passwordHash?: string;
+  role: "admin" | "user";
+  sessionToken: string;
 };
 
 type AuthMode = "signin" | "signup";
@@ -129,6 +133,7 @@ type SignInForm = {
 type SignUpForm = {
   firstName: string;
   lastName: string;
+  pseudo: string;
   email: string;
   password: string;
   confirmPassword: string;
@@ -138,6 +143,7 @@ type SignUpForm = {
 type AccountSettingsForm = {
   firstName: string;
   lastName: string;
+  pseudo: string;
   email: string;
   cursorColor: string;
   currentPassword: string;
@@ -201,6 +207,7 @@ type PointerState = {
   x: number;
   y: number;
   visible: boolean;
+  scrollY: number;
 };
 
 type CollabSignalKind = "ping" | "assist" | "celebrate" | "focus";
@@ -371,6 +378,7 @@ const categoryOptions = [
   "🚚 Amazon Prime",
   "🍏 Apple / Spotify",
   "🧺 Quotidien",
+  "⛽ Essence",
   "❓ Autres",
 ];
 
@@ -385,7 +393,8 @@ const ticketsFinancePreset = {
     { key: "amazon_prime", label: "Amazon Prime", planned: 7, matchCategories: [categoryOptions[6]] },
     { key: "apple_spotify", label: "Apple / Spotify", planned: 18, matchCategories: [categoryOptions[7]] },
     { key: "quotidien", label: "Quotidien", planned: 120, matchCategories: [categoryOptions[8]] },
-    { key: "autres", label: "Autres", planned: 90, matchCategories: [categoryOptions[9]] },
+    { key: "essence", label: "Essence", planned: 180, matchCategories: [categoryOptions[9]] },
+    { key: "autres", label: "Autres", planned: 90, matchCategories: [categoryOptions[10]] },
   ] satisfies TicketBudgetLine[],
 };
 
@@ -500,6 +509,11 @@ const pageMeta: Record<
     subtitle: "Mises a jour, notes de version et historique des releases.",
     action: "Verifier",
   },
+  admin: {
+    title: "Administration",
+    subtitle: "Gestion des comptes, roles et acces de l application.",
+    action: "Rafraichir",
+  },
 };
 
 const collabChannelName = "budget-pc-collab-lab";
@@ -565,7 +579,8 @@ function normalizeEmail(email: string) {
   return email.trim().toLowerCase();
 }
 
-function getAccountDisplayName(account: Pick<AccountProfile, "firstName" | "lastName" | "email">) {
+function getAccountDisplayName(account: Pick<AccountProfile, "pseudo" | "firstName" | "lastName" | "email">) {
+  if (account.pseudo) return account.pseudo;
   const fullName = `${account.firstName} ${account.lastName}`.trim();
   return fullName || account.email;
 }
@@ -587,9 +602,12 @@ function normalizeAccountProfile(data: unknown): AccountProfile | null {
     email,
     firstName: String(row.firstName ?? row.first_name ?? row.prenom ?? ""),
     lastName: String(row.lastName ?? row.last_name ?? row.nom ?? ""),
+    pseudo: String(row.pseudo ?? row.displayName ?? row.nickname ?? ""),
     cursorColor: String(row.cursorColor ?? row.cursor_color ?? row.color ?? collabColors[0]),
     createdAt: String(row.createdAt ?? row.created_at ?? new Date().toISOString()),
     passwordHash: typeof row.passwordHash === "string" ? row.passwordHash : undefined,
+    role: (row as Record<string, unknown>).role === "admin" ? "admin" : "user",
+    sessionToken: String(row.sessionToken ?? row.session_token ?? ""),
   };
 }
 
@@ -1368,6 +1386,7 @@ async function signUpAccountInSheets(form: SignUpForm) {
     password: form.password,
     firstName: form.firstName.trim(),
     lastName: form.lastName.trim(),
+    pseudo: form.pseudo.trim(),
     cursorColor: form.cursorColor,
   })) as { success?: boolean; error?: string; account?: unknown; user?: unknown; profile?: unknown };
 
@@ -1389,6 +1408,7 @@ async function updateRemoteAccountInSheets(
     nextEmail: normalizeEmail(form.email),
     firstName: form.firstName.trim(),
     lastName: form.lastName.trim(),
+    pseudo: form.pseudo.trim(),
     cursorColor: form.cursorColor,
     newPassword: form.newPassword,
   })) as { success?: boolean; error?: string; account?: unknown; user?: unknown; profile?: unknown };
@@ -1398,6 +1418,63 @@ async function updateRemoteAccountInSheets(
   }
 
   return normalizeAuthResponseAccount(response);
+}
+
+async function updateQuickProfileInSheets(
+  account: AccountProfile,
+  pseudo: string,
+  cursorColor: string
+) {
+  const response = (await postSheetsAction({
+    action: "updateQuickProfile",
+    email: account.email,
+    pseudo: pseudo.trim(),
+    cursorColor,
+  })) as { success?: boolean; error?: string; account?: unknown; user?: unknown; profile?: unknown };
+
+  if (response?.success === false) {
+    throw new Error(response.error || "Mise a jour du profil rapide refusee par le serveur.");
+  }
+
+  return normalizeAuthResponseAccount(response);
+}
+
+async function fetchAllUsersFromSheets(adminEmail: string, sessionToken: string) {
+  const response = (await postSheetsAction({
+    action: "listAllAccounts",
+    adminEmail,
+    sessionToken,
+  })) as { success?: boolean; error?: string; accounts?: unknown[] };
+
+  if (response?.success === false) {
+    throw new Error(response.error || "Acces refuse.");
+  }
+
+  const rawAccounts = Array.isArray(response?.accounts) ? response.accounts : [];
+  return rawAccounts
+    .map((a) => normalizeAccountProfile(a))
+    .filter((a): a is AccountProfile => a !== null);
+}
+
+async function updateUserRoleInSheets(
+  adminEmail: string,
+  sessionToken: string,
+  targetEmail: string,
+  newRole: "admin" | "user"
+) {
+  const response = (await postSheetsAction({
+    action: "updateUserRole",
+    adminEmail,
+    sessionToken,
+    targetEmail,
+    role: newRole,
+  })) as { success?: boolean; error?: string };
+
+  if (response?.success === false) {
+    throw new Error(response.error || "Mise a jour du role refusee.");
+  }
+
+  return response;
 }
 
 function getErrorMessage(error: unknown) {
@@ -1491,6 +1568,7 @@ function buildSupabasePresencePayload(
     context: getPresenceContext(page, selectedMonth),
     cursorX: pointer.x,
     cursorY: pointer.y,
+    scrollY: pointer.scrollY,
     insideBoard: pointer.visible,
     lastSeen: Date.now(),
     focusTicketKey: focus.key,
@@ -1873,41 +1951,90 @@ function renderDashboard(
         <div className="dashboard-v3-top-grid">
           <div className="dashboard-v3-left">
             <h1>Budget mensuel</h1>
+            <div className="dashboard-v3-actions">
+              <button className="primary-btn" onClick={onOpenTicketModal}>
+                Nouvelle depense
+              </button>
+              <button className="outline-btn" onClick={onRefreshTickets}>
+                {isBusy ? "Actualisation..." : "Actualiser"}
+              </button>
+            </div>
           </div>
 
           <div className="dashboard-v3-right">
-            <div className="dashboard-v3-period-card">
-              {renderMonthFilter(selectedMonth, onMonthChange)}
-            </div>
+            {(() => {
+              const coursesLine = budgetLines.find((l) => l.key === "courses");
+              const essenceLine = budgetLines.find((l) => l.key === "essence");
+              const coursesBudget = 600;
+              const essenceBudget = 180;
+              const coursesSpent = coursesLine?.actual ?? 0;
+              const essenceSpent = essenceLine?.actual ?? 0;
+              const coursesPct = Math.min(100, (coursesSpent / coursesBudget) * 100);
+              const essencePct = Math.min(100, (essenceSpent / essenceBudget) * 100);
+              const coursesRemain = Math.max(0, coursesBudget - coursesSpent);
+              const essenceRemain = Math.max(0, essenceBudget - essenceSpent);
+              return (
+                <>
+                  <div className="dashboard-v3-row">
+                    <div className="dashboard-budget-gauge-card">
+                      <div className="budget-gauge-item">
+                        <div className="budget-gauge-header">
+                          <span className="budget-gauge-label">🛒 Courses</span>
+                          <span className="budget-gauge-values">{euro.format(coursesSpent)} / {euro.format(coursesBudget)}</span>
+                        </div>
+                        <div className="budget-gauge-track">
+                          <div
+                            className={`budget-gauge-fill ${coursesPct >= 90 ? "danger" : coursesPct >= 70 ? "warn" : "ok"}`}
+                            style={{ width: `${coursesPct}%` }}
+                          />
+                        </div>
+                        <span className="budget-gauge-remain">Reste {euro.format(coursesRemain)}</span>
+                      </div>
+                    </div>
+                    <div className="dashboard-v3-period-card">
+                      {renderMonthFilter(selectedMonth, onMonthChange)}
+                    </div>
+                  </div>
 
-            <div className="dashboard-v3-total-card">
-              <div className="dashboard-v3-total-main">
-                <span className="dashboard-v3-total-label">
-                  Total depenses + remboursement
-                </span>
-                <strong>{euro.format(totalWithReimbursements)}</strong>
-              </div>
+                  <div className="dashboard-v3-row">
+                    <div className="dashboard-budget-gauge-card">
+                      <div className="budget-gauge-item">
+                        <div className="budget-gauge-header">
+                          <span className="budget-gauge-label">⛽ Essence</span>
+                          <span className="budget-gauge-values">{euro.format(essenceSpent)} / {euro.format(essenceBudget)}</span>
+                        </div>
+                        <div className="budget-gauge-track">
+                          <div
+                            className={`budget-gauge-fill ${essencePct >= 90 ? "danger" : essencePct >= 70 ? "warn" : "ok"}`}
+                            style={{ width: `${essencePct}%` }}
+                          />
+                        </div>
+                        <span className="budget-gauge-remain">Reste {euro.format(essenceRemain)}</span>
+                      </div>
+                    </div>
+                    <div className="dashboard-v3-total-card">
+                      <div className="dashboard-v3-total-main">
+                        <span className="dashboard-v3-total-label">
+                          Total depenses + remboursement
+                        </span>
+                        <strong>{euro.format(totalWithReimbursements)}</strong>
+                      </div>
 
-              <div className="dashboard-v3-total-meta">
-                <span>{euro.format(monthlyTotal)} depenses</span>
-                <span>{euro.format(reimbursementTotal)} remboursements</span>
-              </div>
-            </div>
+                      <div className="dashboard-v3-total-meta">
+                        <span>{euro.format(monthlyTotal)} depenses</span>
+                        <span>{euro.format(reimbursementTotal)} remboursements</span>
+                      </div>
+                    </div>
+                  </div>
+                </>
+              );
+            })()}
 
-            <div className="dashboard-v3-status-line">
+            <span className="dashboard-v3-status-line">
               {refreshing ? <span className="sync-badge">Synchro...</span> : null}
-              <span>Etat connexion : {dashboardStatus}</span>
-            </div>
+              Etat connexion : {dashboardStatus}
+            </span>
           </div>
-        </div>
-
-        <div className="dashboard-v3-actions">
-          <button className="primary-btn" onClick={onOpenTicketModal}>
-            Nouvelle depense
-          </button>
-          <button className="outline-btn" onClick={onRefreshTickets}>
-            {isBusy ? "Actualisation..." : "Actualiser"}
-          </button>
         </div>
       </section>
 
@@ -2820,6 +2947,23 @@ function renderCollab(
                 <span>Les autres sessions voient le curseur et les signaux en direct.</span>
               </div>
 
+              {boardPeers.map((peer) => (
+                <div
+                  key={`board-peer-${peer.id}`}
+                  className="remote-cursor"
+                  style={{
+                    left: `${peer.cursorX}%`,
+                    top: `${peer.cursorY}%`,
+                  }}
+                >
+                  <div className="remote-cursor-pin" style={{ backgroundColor: peer.color }} />
+                  <div className="remote-cursor-tag" style={{ borderColor: peer.color }}>
+                    <span className="collab-dot" style={{ backgroundColor: peer.color }} />
+                    <strong>{peer.name}</strong>
+                  </div>
+                </div>
+              ))}
+
               {collabSignals.map((signal) => (
                 <div
                   key={signal.id}
@@ -3177,6 +3321,17 @@ function renderAuthScreen(
                 />
               </label>
 
+              <label className="field-block">
+                <span>Pseudo</span>
+                <input
+                  className="field-input"
+                  type="text"
+                  value={signUpForm.pseudo}
+                  onChange={(event) => onSignUpChange({ pseudo: event.target.value })}
+                  placeholder="Ton pseudo visible dans l app"
+                />
+              </label>
+
               <div className="auth-grid">
                 <label className="field-block">
                   <span>Mot de passe</span>
@@ -3238,7 +3393,8 @@ function renderSettings(
   profileStatus: string,
   profileError: string,
   onChange: (patch: Partial<AccountSettingsForm>) => void,
-  onSave: () => void,
+  onSaveQuick: () => void,
+  onSaveFull: () => void,
   onLogout: () => void
 ) {
   return (
@@ -3246,8 +3402,8 @@ function renderSettings(
       <section className="topbar">
         <div>
           <span className="eyebrow">Compte</span>
-          <h1>Profil et identite multi</h1>
-          <p>Ton nom, ton email et la couleur de curseur qui sera utilisee dans la collab.</p>
+          <h1>Parametres</h1>
+          <p>Gere ton pseudo, ta couleur et ton compte.</p>
         </div>
         <div className="topbar-actions">
           <span className="sync-badge">{getAccountDisplayName(account)}</span>
@@ -3261,8 +3417,60 @@ function renderSettings(
         <article className="panel">
           <div className="panel-head">
             <div>
-              <span className="panel-kicker">Profil</span>
-              <h2>Informations du compte</h2>
+              <span className="panel-kicker">Apparence</span>
+              <h2>Pseudo et couleur</h2>
+            </div>
+          </div>
+
+          <div className="panel-body stack">
+            <label className="field-block">
+              <span>Pseudo</span>
+              <input
+                className="field-input"
+                type="text"
+                value={form.pseudo}
+                onChange={(event) => onChange({ pseudo: event.target.value })}
+                placeholder="Ton pseudo visible par tous"
+              />
+            </label>
+
+            <div className="field-block">
+              <span>Couleur du curseur</span>
+              <div className="color-choice-row">
+                {collabColors.map((color) => (
+                  <button
+                    key={color}
+                    type="button"
+                    className={`color-choice ${form.cursorColor === color ? "active" : ""}`}
+                    style={{ backgroundColor: color }}
+                    onClick={() => onChange({ cursorColor: color })}
+                    aria-label={`Choisir ${color}`}
+                  />
+                ))}
+              </div>
+            </div>
+
+            <div className="settings-preview-row">
+              <span className="collab-dot" style={{ backgroundColor: form.cursorColor }} />
+              <span className="settings-preview-name">{form.pseudo || getAccountDisplayName(account)}</span>
+            </div>
+
+            {profileStatus ? <div className="status ok">{profileStatus}</div> : null}
+            {profileError ? <div className="status warn">{profileError}</div> : null}
+
+            <div className="ticket-modal-actions">
+              <button className="primary-btn" onClick={onSaveQuick} disabled={profileLoading}>
+                {profileLoading ? "Enregistrement..." : "Sauvegarder"}
+              </button>
+            </div>
+          </div>
+        </article>
+
+        <article className="panel">
+          <div className="panel-head">
+            <div>
+              <span className="panel-kicker">Compte</span>
+              <h2>Identite et securite</h2>
             </div>
           </div>
 
@@ -3299,22 +3507,6 @@ function renderSettings(
               />
             </label>
 
-            <div className="field-block">
-              <span>Couleur du curseur</span>
-              <div className="color-choice-row">
-                {collabColors.map((color) => (
-                  <button
-                    key={color}
-                    type="button"
-                    className={`color-choice ${form.cursorColor === color ? "active" : ""}`}
-                    style={{ backgroundColor: color }}
-                    onClick={() => onChange({ cursorColor: color })}
-                    aria-label={`Choisir ${color}`}
-                  />
-                ))}
-              </div>
-            </div>
-
             <label className="field-block">
               <span>Mot de passe actuel</span>
               <input
@@ -3322,7 +3514,7 @@ function renderSettings(
                 type="password"
                 value={form.currentPassword}
                 onChange={(event) => onChange({ currentPassword: event.target.value })}
-                placeholder="Obligatoire pour sauvegarder"
+                placeholder="Requis pour modifier cette section"
               />
             </label>
 
@@ -3339,49 +3531,21 @@ function renderSettings(
               </label>
 
               <label className="field-block">
-                <span>Confirmation nouveau mot de passe</span>
+                <span>Confirmation</span>
                 <input
                   className="field-input"
                   type="password"
                   value={form.confirmPassword}
                   onChange={(event) => onChange({ confirmPassword: event.target.value })}
-                  placeholder="Retape le nouveau mot de passe"
+                  placeholder="Retape le nouveau mdp"
                 />
               </label>
             </div>
 
-            {profileStatus ? <div className="status ok">{profileStatus}</div> : null}
-            {profileError ? <div className="status warn">{profileError}</div> : null}
-
             <div className="ticket-modal-actions">
-              <button className="primary-btn" onClick={onSave} disabled={profileLoading}>
-                {profileLoading ? "Enregistrement..." : "Enregistrer le profil"}
+              <button className="primary-btn" onClick={onSaveFull} disabled={profileLoading}>
+                {profileLoading ? "Enregistrement..." : "Modifier le compte"}
               </button>
-            </div>
-          </div>
-        </article>
-
-        <article className="panel">
-          <div className="panel-head">
-            <div>
-              <span className="panel-kicker">Apercu multi</span>
-              <h2>Presence future</h2>
-            </div>
-          </div>
-
-          <div className="panel-body stack">
-            <div className="activity-item simple">
-              <div>
-                <strong>{getAccountDisplayName(account)}</strong>
-                <span>{account.email}</span>
-              </div>
-            </div>
-            <div className="ticket-peer-chip settings-cursor-preview">
-              <span className="collab-dot" style={{ backgroundColor: form.cursorColor }} />
-              Ton curseur apparaitra avec cette couleur dans la vue collab.
-            </div>
-            <div className="status info">
-              Ton profil peut maintenant vivre au dela du stockage local de l app.
             </div>
           </div>
         </article>
@@ -3391,6 +3555,26 @@ function renderSettings(
 }
 
 const patchNotesData: { version: string; date: string; notes: string[] }[] = [
+  {
+    version: "0.1.20",
+    date: "2026-04-14",
+    notes: [
+      "Nouveau panel Admin reserve aux comptes autorises",
+      "Gestion des comptes: email, prenom, nom, pseudo, couleur, role",
+      "Promotion et retrait du statut admin pour les co-gerants",
+      "Blocage d acces a la page Admin pour les comptes non autorises",
+      "Ajout du compteur en ligne cliquable avec popup des utilisateurs connectes",
+      "Refonte visuelle du dashboard (cartes Courses / Essence et alignements)",
+      "Mise a jour backend comptes: role admin/user + sessionToken + actions admin",
+    ],
+  },
+  {
+    version: "0.1.19",
+    date: "2026-04-14",
+    notes: [
+      "Correction de l affichage Invalid Date sur l ecran de mise a jour",
+    ],
+  },
   {
     version: "0.1.18",
     date: "2026-04-14",
@@ -3463,6 +3647,108 @@ const patchNotesData: { version: string; date: string; notes: string[] }[] = [
   },
 ];
 
+function renderAdminPage(
+  currentAccount: AccountProfile,
+  adminUsers: AccountProfile[],
+  adminLoading: boolean,
+  adminError: string,
+  onLoadUsers: () => void,
+  onToggleRole: (targetEmail: string, newRole: "admin" | "user") => void
+) {
+  if (currentAccount.role !== "admin") {
+    return (
+      <section className="panel admin-blocked-panel">
+        <div className="admin-blocked">
+          <span className="admin-blocked-icon">🔒</span>
+          <h2>Acces restreint</h2>
+          <p>Cette section est reservee aux administrateurs.</p>
+        </div>
+      </section>
+    );
+  }
+
+  return (
+    <section className="panel admin-panel">
+      <div className="admin-header">
+        <div>
+          <h1>Administration</h1>
+          <p className="admin-subtitle">Gestion des comptes et autorisations</p>
+        </div>
+        <button className="primary-btn" onClick={onLoadUsers} disabled={adminLoading}>
+          {adminLoading ? "Chargement..." : "Rafraichir"}
+        </button>
+      </div>
+
+      {adminError && <div className="admin-error">{adminError}</div>}
+
+      {adminUsers.length === 0 && !adminLoading && !adminError && (
+        <div className="admin-empty">
+          <p>Cliquez sur Rafraichir pour charger les comptes.</p>
+        </div>
+      )}
+
+      {adminUsers.length > 0 && (
+        <div className="admin-table-wrapper">
+          <table className="admin-table">
+            <thead>
+              <tr>
+                <th>Pseudo</th>
+                <th>Prenom</th>
+                <th>Nom</th>
+                <th>Email</th>
+                <th>Couleur</th>
+                <th>Role</th>
+                <th>Inscrit le</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {adminUsers.map((user) => {
+                const isSelf = user.email === currentAccount.email;
+                return (
+                  <tr key={user.id} className={isSelf ? "admin-row-self" : ""}>
+                    <td className="admin-cell-name">
+                      <span className="admin-user-dot" style={{ background: user.cursorColor }} />
+                      {user.pseudo || "—"}
+                    </td>
+                    <td>{user.firstName || "—"}</td>
+                    <td>{user.lastName || "—"}</td>
+                    <td className="admin-cell-email">{user.email}</td>
+                    <td>
+                      <span className="admin-color-chip" style={{ background: user.cursorColor }} />
+                    </td>
+                    <td>
+                      <span className={`admin-role-badge ${user.role === "admin" ? "admin-role-admin" : "admin-role-user"}`}>
+                        {user.role === "admin" ? "Admin" : "Utilisateur"}
+                      </span>
+                    </td>
+                    <td className="admin-cell-date">
+                      {user.createdAt ? new Date(user.createdAt).toLocaleDateString("fr-FR") : "—"}
+                    </td>
+                    <td>
+                      {isSelf ? (
+                        <span className="admin-you-tag">Vous</span>
+                      ) : (
+                        <button
+                          className={user.role === "admin" ? "outline-btn admin-demote-btn" : "primary-btn admin-promote-btn"}
+                          onClick={() => onToggleRole(user.email, user.role === "admin" ? "user" : "admin")}
+                          disabled={adminLoading}
+                        >
+                          {user.role === "admin" ? "Retirer admin" : "Promouvoir admin"}
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function renderVersionPage(
   updaterStatus: UpdaterStatus | null,
   availableUpdate: AvailableUpdate | null,
@@ -3521,7 +3807,7 @@ function renderVersionPage(
                 <div className="status info">
                   Nouvelle version disponible : v{availableUpdate.version}
                   {availableUpdate.pubDate
-                    ? ` — ${new Date(availableUpdate.pubDate).toLocaleDateString("fr-FR")}`
+                    ? (() => { const d = new Date(availableUpdate.pubDate!); return isNaN(d.getTime()) ? "" : ` — ${d.toLocaleDateString("fr-FR")}`; })()
                     : ""}
                 </div>
               ) : null}
@@ -3810,6 +4096,7 @@ function App() {
   const [signUpForm, setSignUpForm] = useState<SignUpForm>({
     firstName: "",
     lastName: "",
+    pseudo: "",
     email: "",
     password: "",
     confirmPassword: "",
@@ -3818,6 +4105,7 @@ function App() {
   const [accountSettingsForm, setAccountSettingsForm] = useState<AccountSettingsForm>({
     firstName: "",
     lastName: "",
+    pseudo: "",
     email: "",
     cursorColor: collabColors[0],
     currentPassword: "",
@@ -3840,7 +4128,7 @@ function App() {
   const [installingUpdate, setInstallingUpdate] = useState(false);
   const [updaterMessage, setUpdaterMessage] = useState("");
   const [updaterError, setUpdaterError] = useState("");
-  const [selectedPatchVersion, setSelectedPatchVersion] = useState("0.1.18");
+  const [selectedPatchVersion, setSelectedPatchVersion] = useState("0.1.19");
   const [tickets, setTickets] = useState<Ticket[]>([]);
   const [dashboardSubscriptions, setDashboardSubscriptions] = useState<DashboardSubscription[]>(() => {
     try {
@@ -3895,6 +4183,10 @@ function App() {
   const [collabFeed, setCollabFeed] = useState<CollabFeedItem[]>([]);
   const [collabSignals, setCollabSignals] = useState<CollabSignal[]>([]);
   const [followedPeerId, setFollowedPeerId] = useState("");
+  const [showOnlinePopup, setShowOnlinePopup] = useState(false);
+  const [adminUsers, setAdminUsers] = useState<AccountProfile[]>([]);
+  const [adminLoading, setAdminLoading] = useState(false);
+  const [adminError, setAdminError] = useState("");
   const [collabConnectionState, setCollabConnectionState] = useState<
     "connecting" | "live" | "unstable"
   >("connecting");
@@ -3923,10 +4215,16 @@ function App() {
   const lastLoadedMonthRef = useRef("");
   const collabNoteTimestampRef = useRef(0);
   const sharedNoteRef = useRef(sharedNote);
-  const collabPointerStateRef = useRef<PointerState>({ x: 50, y: 50, visible: false });
+  const collabPointerStateRef = useRef<PointerState>({
+    x: 50,
+    y: 50,
+    visible: false,
+    scrollY: 0,
+  });
   const collabFocusRef = useRef({ key: "", label: "" });
   const lastPointerSentAtRef = useRef(0);
   const mainScrollYRef = useRef(0);
+  const [mainScrollY, setMainScrollY] = useState(0);
   const mainElRef = useRef<HTMLElement | null>(null);
   const supabaseChannelRef = useRef<RealtimeChannel | null>(null);
   const pushSupabasePresenceRef = useRef<((event?: "heartbeat" | "pointer" | "focus") => void) | null>(null);
@@ -3939,9 +4237,10 @@ function App() {
   const isTauriRuntime =
     typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
   const collaborators = mergeCollaboratorLists(localCollaborators, remoteCollaborators);
-  const visibleRemoteCursors = collaborators.filter(
-    (peer) => peer.insideBoard && peer.page === page
-  );
+  const visibleRemoteCursors =
+    page === "collab"
+      ? []
+      : collaborators.filter((peer) => peer.insideBoard && peer.page === page);
   const ticketCategoryChoices = getTicketCategoryChoices(tickets);
   const visibleTickets = filterAndSortTickets(
     tickets,
@@ -3953,7 +4252,7 @@ function App() {
   const updateAvailable = Boolean(availableUpdate);
   const updateBannerDateLabel =
     updateAvailable && availableUpdate?.pubDate
-      ? new Date(availableUpdate.pubDate).toLocaleDateString("fr-FR")
+      ? (() => { const d = new Date(availableUpdate.pubDate!); return isNaN(d.getTime()) ? "" : d.toLocaleDateString("fr-FR"); })()
       : "";
 
   useEffect(() => {
@@ -3999,6 +4298,7 @@ function App() {
     setAccountSettingsForm({
       firstName: currentAccount.firstName,
       lastName: currentAccount.lastName,
+      pseudo: currentAccount.pseudo,
       email: currentAccount.email,
       cursorColor: currentAccount.cursorColor,
       currentPassword: "",
@@ -5376,11 +5676,17 @@ function App() {
     const email = normalizeEmail(signUpForm.email);
     const firstName = signUpForm.firstName.trim();
     const lastName = signUpForm.lastName.trim();
+    const pseudo = signUpForm.pseudo.trim();
     const password = signUpForm.password;
     const confirmPassword = signUpForm.confirmPassword;
 
     if (!firstName || !lastName || !email || !password) {
       setAuthError("Prenom, nom, email et mot de passe sont obligatoires.");
+      return;
+    }
+
+    if (!pseudo) {
+      setAuthError("Le pseudo est obligatoire.");
       return;
     }
 
@@ -5407,6 +5713,7 @@ function App() {
       setSignUpForm({
         firstName: "",
         lastName: "",
+        pseudo: "",
         email: "",
         password: "",
         confirmPassword: "",
@@ -5437,6 +5744,76 @@ function App() {
     setPage("dashboard");
   };
 
+  const handleLoadAdminUsers = async () => {
+    if (!currentAccount || currentAccount.role !== "admin") return;
+    setAdminLoading(true);
+    setAdminError("");
+    try {
+      const users = await fetchAllUsersFromSheets(currentAccount.email, currentAccount.sessionToken);
+      setAdminUsers(users);
+    } catch (err) {
+      setAdminError(getErrorMessage(err));
+    } finally {
+      setAdminLoading(false);
+    }
+  };
+
+  const handleToggleUserRole = async (targetEmail: string, newRole: "admin" | "user") => {
+    if (!currentAccount || currentAccount.role !== "admin") return;
+    setAdminLoading(true);
+    setAdminError("");
+    try {
+      await updateUserRoleInSheets(
+        currentAccount.email,
+        currentAccount.sessionToken,
+        targetEmail,
+        newRole
+      );
+      await handleLoadAdminUsers();
+    } catch (err) {
+      setAdminError(getErrorMessage(err));
+      setAdminLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!currentAccount) {
+      return;
+    }
+
+    if (page === "admin" && currentAccount.role !== "admin") {
+      setPage("dashboard");
+      return;
+    }
+
+    if (page === "admin" && currentAccount.role === "admin" && !adminLoading && adminUsers.length === 0) {
+      void handleLoadAdminUsers();
+    }
+  }, [page, currentAccount, adminLoading, adminUsers.length]);
+
+  const handleSaveQuickProfile = async () => {
+    if (!currentAccount) return;
+
+    try {
+      setAccountSettingsLoading(true);
+      setAccountSettingsError("");
+      setAccountSettingsStatus("");
+
+      const updatedAccount = await updateQuickProfileInSheets(
+        currentAccount,
+        accountSettingsForm.pseudo,
+        accountSettingsForm.cursorColor
+      );
+      persistSessionAccount(updatedAccount);
+      setCurrentAccount(updatedAccount);
+      setAccountSettingsStatus("Pseudo et couleur mis a jour.");
+    } catch (error) {
+      setAccountSettingsError(getErrorMessage(error));
+    } finally {
+      setAccountSettingsLoading(false);
+    }
+  };
+
   const handleSaveAccountSettings = async () => {
     if (!currentAccount) {
       return;
@@ -5455,7 +5832,7 @@ function App() {
     }
 
     if (!currentPassword) {
-      setAccountSettingsError("Le mot de passe actuel est obligatoire pour sauvegarder.");
+      setAccountSettingsError("Le mot de passe actuel est obligatoire pour modifier le compte.");
       return;
     }
 
@@ -5478,7 +5855,7 @@ function App() {
       persistSessionAccount(updatedAccount);
       setCurrentAccount(updatedAccount);
       setSignInForm((current) => ({ ...current, email: updatedAccount.email }));
-      setAccountSettingsStatus("Profil distant mis a jour.");
+      setAccountSettingsStatus("Compte mis a jour.");
     } catch (error) {
       setAccountSettingsError(getErrorMessage(error));
     } finally {
@@ -5918,7 +6295,7 @@ function App() {
   };
 
   const broadcastPointer = (x: number, y: number, visible: boolean, scrollY = 0) => {
-    collabPointerStateRef.current = { x, y, visible };
+    collabPointerStateRef.current = { x, y, visible, scrollY };
 
     collabChannelRef.current?.postMessage({
       type: "pointer",
@@ -5957,6 +6334,7 @@ function App() {
   };
 
     const handleCollabBoardPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+      event.stopPropagation();
       const rect = event.currentTarget.getBoundingClientRect();
       if (rect.width === 0 || rect.height === 0) {
         return;
@@ -5971,23 +6349,25 @@ function App() {
       }
 
       lastPointerSentAtRef.current = now;
-      broadcastPointer(x, y, true);
+      broadcastPointer(x, y, true, 0);
     };
 
     const handleCollabBoardPointerLeave = () => {
-      broadcastPointer(50, 50, false);
+      broadcastPointer(50, 50, false, 0);
     };
 
     const handleGlobalPointerMove = (event: ReactPointerEvent<HTMLElement>) => {
-    const viewportWidth = window.innerWidth;
-    const viewportHeight = window.innerHeight;
-
-    if (viewportWidth === 0 || viewportHeight === 0) {
+    if (pageRef.current === "collab") {
       return;
     }
 
-    const x = Math.max(0, Math.min(100, (event.clientX / viewportWidth) * 100));
-    const y = Math.max(0, Math.min(100, (event.clientY / viewportHeight) * 100));
+    const mainRect = mainElRef.current?.getBoundingClientRect();
+    if (!mainRect || mainRect.width === 0 || mainRect.height === 0) {
+      return;
+    }
+
+    const x = Math.max(0, Math.min(100, ((event.clientX - mainRect.left) / mainRect.width) * 100));
+    const y = Math.max(0, Math.min(100, ((event.clientY - mainRect.top) / mainRect.height) * 100));
     const now = Date.now();
 
     if (now - lastPointerSentAtRef.current < 24) {
@@ -6040,7 +6420,9 @@ function App() {
     { key: "collab", label: "Collab", badge: String(collaborators.length + 1) },
     { key: "settings", label: "Parametres" },
     { key: "version", label: "Version" },
+    ...(currentAccount.role === "admin" ? [{ key: "admin" as PageKey, label: "Admin" }] : []),
   ];
+  const mainViewportRect = mainElRef.current?.getBoundingClientRect() ?? null;
 
   const historyModal =
     historyPanelOpen && typeof document !== "undefined"
@@ -6169,16 +6551,37 @@ function App() {
           <div className="sidebar-section">
             <span className="section-label">Navigation</span>
             <nav className="nav">
-              {menu.map((item) => (
-                <button
-                  key={item.key}
-                  className={`nav-item ${page === item.key ? "active" : ""}`}
-                  onClick={() => changePageWithHistory(item.key)}
-                >
-                  <span>{item.label}</span>
-                  {item.badge ? <span className="nav-badge">{item.badge}</span> : null}
-                </button>
-              ))}
+              {menu.map((item) => {
+                const peersOnPage = collaborators.filter((p) => p.page === item.key);
+                return (
+                  <button
+                    key={item.key}
+                    className={`nav-item ${page === item.key ? "active" : ""}`}
+                    onClick={() => changePageWithHistory(item.key)}
+                  >
+                    <span className="nav-item-top">
+                      <span>{item.label}</span>
+                      {item.badge ? <span className="nav-badge">{item.badge}</span> : null}
+                    </span>
+                    {peersOnPage.length > 0 ? (
+                      <span className="nav-peers">
+                        {peersOnPage.slice(0, 3).map((peer) => (
+                          <span
+                            key={peer.id}
+                            className="nav-peer-bubble"
+                            style={{ backgroundColor: peer.color + "22", borderColor: peer.color, color: peer.color }}
+                          >
+                            {peer.name}
+                          </span>
+                        ))}
+                        {peersOnPage.length > 3 ? (
+                          <span className="nav-peer-overflow">+{peersOnPage.length - 3}</span>
+                        ) : null}
+                      </span>
+                    ) : null}
+                  </button>
+                );
+              })}
             </nav>
           </div>
 
@@ -6197,7 +6600,53 @@ function App() {
         </div>
       </aside>
 
-      <main className="main" ref={mainElRef} onScroll={(e) => { mainScrollYRef.current = (e.target as HTMLElement).scrollTop; }}>
+      <main
+        className="main"
+        ref={mainElRef}
+        onScroll={(e) => {
+          const nextScrollTop = (e.target as HTMLElement).scrollTop;
+          mainScrollYRef.current = nextScrollTop;
+          setMainScrollY(nextScrollTop);
+        }}
+      >
+
+        {(() => {
+          const onlinePeers = collaborators.filter(
+            (p) => Date.now() - p.lastSeen < collabPresenceTimeoutMs
+          );
+          const onlineCount = onlinePeers.length + 1;
+          return (
+            <div className="online-badge-wrapper">
+              <button
+                className="online-badge"
+                onClick={() => setShowOnlinePopup((v) => !v)}
+                title={`${onlineCount} en ligne`}
+              >
+                <span className="online-badge-dot" />
+                <span className="online-badge-count">{onlineCount}</span>
+              </button>
+              {showOnlinePopup && (
+                <div className="online-popup">
+                  <div className="online-popup-title">En ligne ({onlineCount})</div>
+                  <ul className="online-popup-list">
+                    <li className="online-popup-item">
+                      <span className="online-popup-dot" style={{ background: currentAccount.cursorColor }} />
+                      <span className="online-popup-name">{getAccountDisplayName(currentAccount)}</span>
+                      <span className="online-popup-you">vous</span>
+                    </li>
+                    {onlinePeers.map((peer) => (
+                      <li key={peer.id} className="online-popup-item">
+                        <span className="online-popup-dot" style={{ background: peer.color }} />
+                        <span className="online-popup-name">{peer.name || "Anonyme"}</span>
+                        <span className="online-popup-page">{peer.page}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+          );
+        })()}
 
         <div className="history-toolbar">
           <div className="history-toolbar-actions">
@@ -6236,16 +6685,24 @@ function App() {
   
         <div className="global-cursor-layer">
           {visibleRemoteCursors.map((peer) => {
-            const scrollDelta = peer.scrollY - mainScrollYRef.current;
-            const viewportH = window.innerHeight;
-            const offsetPx = viewportH > 0 ? (scrollDelta / viewportH) * 100 : 0;
+            if (!mainViewportRect) {
+              return null;
+            }
+
+            const scrollDelta = peer.scrollY - mainScrollY;
+            const leftPx = mainViewportRect.left + (peer.cursorX / 100) * mainViewportRect.width;
+            const topPx =
+              mainViewportRect.top +
+              (peer.cursorY / 100) * mainViewportRect.height +
+              scrollDelta;
+
             return (
               <div
                 className="remote-cursor global"
                 key={`global-${peer.id}`}
                 style={{
-                  left: `${peer.cursorX}%`,
-                  top: `calc(${peer.cursorY}% + ${offsetPx}vh)`,
+                  left: `${leftPx}px`,
+                  top: `${topPx}px`,
                 }}
               >
                 <div className="remote-cursor-pin" style={{ backgroundColor: peer.color }} />
@@ -6396,6 +6853,7 @@ function App() {
               setAccountSettingsError("");
               setAccountSettingsStatus("");
             },
+            handleSaveQuickProfile,
             handleSaveAccountSettings,
             handleLogout
           )}
@@ -6412,7 +6870,16 @@ function App() {
             handleCheckUpdates,
             handleInstallUpdate
           )}
-        {!["dashboard", "tickets", "collab", "settings", "version"].includes(page) && renderPlaceholder(page)}
+        {page === "admin" &&
+          renderAdminPage(
+            currentAccount,
+            adminUsers,
+            adminLoading,
+            adminError,
+            handleLoadAdminUsers,
+            handleToggleUserRole
+          )}
+        {!["dashboard", "tickets", "collab", "settings", "version", "admin"].includes(page) && renderPlaceholder(page)}
 
       </main>
       {historyModal}

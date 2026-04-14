@@ -101,11 +101,21 @@ Secrets :
 5. Quand tu veux sortir une version, cree un tag :
 
 ```powershell
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.1.20
+git push origin v0.1.20
 ```
 
 6. GitHub Actions fera la release automatiquement.
+
+## 7. Patch notes 0.1.20
+
+- Ajout du panel Admin (acces restreint aux admins)
+- Liste des comptes avec email, prenom, nom, pseudo, couleur et role
+- Promotion / retrait du role admin pour les co-gerants
+- Blocage d acces aux actions admin sans autorisation
+- Compteur utilisateurs en ligne cliquable avec popup des noms
+- Refonte visuelle des cartes Courses / Essence sur le dashboard
+- Backend comptes et securite: role admin/user + sessionToken + actions admin
 
 ## 6. Cote utilisateur
 

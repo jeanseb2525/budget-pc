@@ -66,6 +66,21 @@ function doPost(e) {
       return jsonOutput_({ success: true, account: account });
     }
 
+    if (action === "updateQuickProfile") {
+      const account = updateQuickProfile_(data);
+      return jsonOutput_({ success: true, account: account });
+    }
+
+    if (action === "listAllAccounts") {
+      const accounts = listAllAccounts_(data);
+      return jsonOutput_({ success: true, accounts: accounts });
+    }
+
+    if (action === "updateUserRole") {
+      const account = updateUserRole_(data);
+      return jsonOutput_({ success: true, account: account });
+    }
+
     if (action === "addReimbursements") {
       const mois = String(data.mois || "").trim();
       const entries = Array.isArray(data.entries) ? data.entries : [];
@@ -341,6 +356,10 @@ function createPasswordSalt_() {
   return Utilities.getUuid().replace(/-/g, "");
 }
 
+function createSessionToken_() {
+  return Utilities.getUuid().replace(/-/g, "") + Utilities.getUuid().replace(/-/g, "");
+}
+
 function buildPasswordHash_(password, salt) {
   return digestHex_(String(salt || "") + "::" + String(password || ""));
 }
@@ -348,21 +367,28 @@ function buildPasswordHash_(password, salt) {
 function ensureUsersSheet_() {
   const ss = getBudgetSpreadsheet_();
   let sh = ss.getSheetByName(USERS_SHEET_NAME);
+  const headers = [[
+    "id",
+    "email",
+    "firstName",
+    "lastName",
+    "cursorColor",
+    "passwordSalt",
+    "passwordHash",
+    "createdAt",
+    "updatedAt",
+    "pseudo",
+    "role",
+    "sessionToken"
+  ]];
 
   if (!sh) {
     sh = ss.insertSheet(USERS_SHEET_NAME);
-    sh.getRange(1, 1, 1, 9).setValues([[
-      "id",
-      "email",
-      "firstName",
-      "lastName",
-      "cursorColor",
-      "passwordSalt",
-      "passwordHash",
-      "createdAt",
-      "updatedAt"
-    ]]);
+    sh.getRange(1, 1, 1, 12).setValues(headers);
     sh.hideSheet();
+  } else if (sh.getLastColumn() < 12) {
+    sh.insertColumnsAfter(sh.getLastColumn(), 12 - sh.getLastColumn());
+    sh.getRange(1, 1, 1, 12).setValues(headers);
   }
 
   return sh;
@@ -376,7 +402,7 @@ function getAllUserRows_() {
     return [];
   }
 
-  return sh.getRange(2, 1, lastRow - 1, 9).getValues().map(function (row, index) {
+  return sh.getRange(2, 1, lastRow - 1, 12).getValues().map(function (row, index) {
     return {
       rowNumber: index + 2,
       id: String(row[0] || ""),
@@ -387,9 +413,32 @@ function getAllUserRows_() {
       passwordSalt: String(row[5] || ""),
       passwordHash: String(row[6] || ""),
       createdAt: String(row[7] || ""),
-      updatedAt: String(row[8] || "")
+      updatedAt: String(row[8] || ""),
+      pseudo: String(row[9] || ""),
+      role: String(row[10] || "") === "admin" ? "admin" : "user",
+      sessionToken: String(row[11] || "")
     };
   });
+}
+
+function getEffectiveRole_(user, allUsers) {
+  const users = Array.isArray(allUsers) ? allUsers : getAllUserRows_();
+  const hasExplicitAdmin = users.some(function (item) {
+    return String(item.role || "") === "admin";
+  });
+
+  if (String(user.role || "") === "admin") {
+    return "admin";
+  }
+
+  if (!hasExplicitAdmin) {
+    const firstUser = users[0] || null;
+    if (firstUser && firstUser.email === user.email) {
+      return "admin";
+    }
+  }
+
+  return "user";
 }
 
 function findUserByEmail_(email) {
@@ -400,13 +449,17 @@ function findUserByEmail_(email) {
 }
 
 function toPublicAccount_(user) {
+  var users = getAllUserRows_();
   return {
     id: String(user.id || ""),
     email: normalizeAccountEmail_(user.email),
     firstName: String(user.firstName || ""),
     lastName: String(user.lastName || ""),
     cursorColor: String(user.cursorColor || "#f58d68"),
-    createdAt: String(user.createdAt || "")
+    createdAt: String(user.createdAt || ""),
+    pseudo: String(user.pseudo || ""),
+    role: getEffectiveRole_(user, users),
+    sessionToken: String(user.sessionToken || "")
   };
 }
 
@@ -433,11 +486,16 @@ function signUpAccount_(data) {
     throw new Error("Un compte existe deja avec cet email.");
   }
 
+  var pseudo = String(data.pseudo || "").trim();
+
   const sh = ensureUsersSheet_();
   const id = Utilities.getUuid();
   const now = new Date().toISOString();
   const salt = createPasswordSalt_();
   const hash = buildPasswordHash_(password, salt);
+  const sessionToken = createSessionToken_();
+  const isFirstAccount = getAllUserRows_().length === 0;
+  const role = isFirstAccount ? "admin" : "user";
 
   sh.appendRow([
     id,
@@ -448,7 +506,10 @@ function signUpAccount_(data) {
     salt,
     hash,
     now,
-    now
+    now,
+    pseudo,
+    role,
+    sessionToken
   ]);
 
   return {
@@ -457,7 +518,10 @@ function signUpAccount_(data) {
     firstName: firstName,
     lastName: lastName,
     cursorColor: cursorColor,
-    createdAt: now
+    createdAt: now,
+    pseudo: pseudo,
+    role: role,
+    sessionToken: sessionToken
   };
 }
 
@@ -478,6 +542,11 @@ function signInAccount_(data) {
   if (candidateHash !== user.passwordHash) {
     throw new Error("Identifiants invalides.");
   }
+
+  const sessionToken = createSessionToken_();
+  const sh = ensureUsersSheet_();
+  sh.getRange(user.rowNumber, 12).setValue(sessionToken);
+  user.sessionToken = sessionToken;
 
   return toPublicAccount_(user);
 }
@@ -518,12 +587,14 @@ function updateAccountProfile_(data) {
     throw new Error("Cet email est deja utilise par un autre compte.");
   }
 
+  var pseudo = String(data.pseudo || "").trim();
+
   const sh = ensureUsersSheet_();
   const now = new Date().toISOString();
   const nextSalt = newPassword ? createPasswordSalt_() : user.passwordSalt;
   const nextHash = newPassword ? buildPasswordHash_(newPassword, nextSalt) : user.passwordHash;
 
-  sh.getRange(user.rowNumber, 1, 1, 9).setValues([[
+  sh.getRange(user.rowNumber, 1, 1, 12).setValues([[
     user.id,
     nextEmail,
     firstName,
@@ -532,7 +603,10 @@ function updateAccountProfile_(data) {
     nextSalt,
     nextHash,
     user.createdAt,
-    now
+    now,
+    pseudo,
+    user.role || "user",
+    user.sessionToken || ""
   ]]);
 
   return {
@@ -541,8 +615,119 @@ function updateAccountProfile_(data) {
     firstName: firstName,
     lastName: lastName,
     cursorColor: cursorColor,
-    createdAt: user.createdAt
+    createdAt: user.createdAt,
+    pseudo: pseudo,
+    role: getEffectiveRole_(user),
+    sessionToken: String(user.sessionToken || "")
   };
+}
+
+function updateQuickProfile_(data) {
+  var email = normalizeAccountEmail_(data.email);
+  var pseudo = String(data.pseudo || "").trim();
+  var cursorColor = String(data.cursorColor || "#f58d68").trim() || "#f58d68";
+
+  if (!email) {
+    throw new Error("Email obligatoire.");
+  }
+
+  var user = findUserByEmail_(email);
+  if (!user) {
+    throw new Error("Compte introuvable.");
+  }
+
+  var sh = ensureUsersSheet_();
+  var now = new Date().toISOString();
+
+  sh.getRange(user.rowNumber, 1, 1, 12).setValues([[
+    user.id,
+    user.email,
+    user.firstName,
+    user.lastName,
+    cursorColor,
+    user.passwordSalt,
+    user.passwordHash,
+    user.createdAt,
+    now,
+    pseudo,
+    user.role || "user",
+    user.sessionToken || ""
+  ]]);
+
+  return {
+    id: user.id,
+    email: user.email,
+    firstName: user.firstName,
+    lastName: user.lastName,
+    cursorColor: cursorColor,
+    createdAt: user.createdAt,
+    pseudo: pseudo,
+    role: getEffectiveRole_(user),
+    sessionToken: String(user.sessionToken || "")
+  };
+}
+
+function requireAdminSession_(email, sessionToken) {
+  var user = findUserByEmail_(email);
+  if (!user) {
+    throw new Error("Compte administrateur introuvable.");
+  }
+
+  if (getEffectiveRole_(user) !== "admin") {
+    throw new Error("Acces administrateur requis.");
+  }
+
+  if (!sessionToken || String(user.sessionToken || "") !== String(sessionToken)) {
+    throw new Error("Session admin invalide. Reconnectez-vous.");
+  }
+
+  return user;
+}
+
+function listAllAccounts_(data) {
+  var adminEmail = normalizeAccountEmail_(data.adminEmail);
+  var sessionToken = String(data.sessionToken || "");
+  requireAdminSession_(adminEmail, sessionToken);
+  return getAllUserRows_().map(toPublicAccount_);
+}
+
+function updateUserRole_(data) {
+  var adminEmail = normalizeAccountEmail_(data.adminEmail);
+  var sessionToken = String(data.sessionToken || "");
+  var targetEmail = normalizeAccountEmail_(data.targetEmail);
+  var role = String(data.role || "user") === "admin" ? "admin" : "user";
+  var adminUser = requireAdminSession_(adminEmail, sessionToken);
+  var targetUser = findUserByEmail_(targetEmail);
+
+  if (!targetUser) {
+    throw new Error("Compte cible introuvable.");
+  }
+
+  if (adminUser.email === targetUser.email && role !== "admin") {
+    throw new Error("Vous ne pouvez pas retirer votre propre acces admin.");
+  }
+
+  var sh = ensureUsersSheet_();
+  var now = new Date().toISOString();
+
+  sh.getRange(targetUser.rowNumber, 1, 1, 12).setValues([[
+    targetUser.id,
+    targetUser.email,
+    targetUser.firstName,
+    targetUser.lastName,
+    targetUser.cursorColor,
+    targetUser.passwordSalt,
+    targetUser.passwordHash,
+    targetUser.createdAt,
+    now,
+    targetUser.pseudo,
+    role,
+    targetUser.sessionToken || ""
+  ]]);
+
+  targetUser.role = role;
+  targetUser.updatedAt = now;
+  return toPublicAccount_(targetUser);
 }
 
 function getUserSentState(month) {
