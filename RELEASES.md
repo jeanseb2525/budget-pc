@@ -107,6 +107,65 @@ git push origin v0.1.20
 
 6. GitHub Actions fera la release automatiquement.
 
+
+
+## 7. Patch notes 0.1.21
+
+- Correction et amélioration de l'affichage des cartes Courses et Essence sur le dashboard
+- Amélioration du menu Admin (ergonomie, gestion des rôles, accès, à améliorer)
+- Modification du système de tickets (ajout, édition, suivi)
+- Ajout de la création de ticket (fonctionnelle mais à améliorer)
+- Divers correctifs et ajustements visuels
+
+
+## Patch notes précédentes
+
+### v0.1.19 (14/04/2026)
+Correction de l'affichage Invalid Date sur l'écran de mise à jour
+
+
+### v0.1.18 (14/04/2026)
+Correction de l'ordre des derniers tickets sur le dashboard (les plus récents en premier)
+
+### v0.1.17 (14/04/2026)
+Mise à jour obligatoire : overlay bloquant si une MAJ est disponible
+Vérification automatique des mises à jour toutes les 5 minutes
+Redémarrage automatique après installation de la mise à jour
+Nouvelle page Version avec patch notes et sélecteur de version
+Suppression du bandeau de mise à jour optionnel
+
+### v0.1.16 (01/06/2025)
+Ajout de la page Version avec patch notes
+Synchronisation des abonnements entre utilisateurs
+Correction du curseur collaboratif avec le scroll
+Historique séparé App / Google Sheets en deux colonnes
+Validation du formulaire d'ajout d'abonnement
+Effets hover/active sur les boutons modaux
+
+### v0.1.15 (25/05/2025)
+Système d'abonnements dynamiques avec ajout/suppression
+Modale d'ajout et de suppression d'abonnement
+Toast et historique pour les actions abonnements
+Signaux collaboratifs (ping, assist, celebrate, focus)
+
+### v0.1.14 (18/05/2025)
+Vue collaboration multi-utilisateurs en temps réel
+Curseurs distants avec couleur personnalisée
+Note partagée synchronisée entre pairs
+Badges de présence et liste des collaborateurs
+
+### v0.1.13 (10/05/2025)
+Page Paramètres avec profil et identité
+Sauvegarde du profil dans Supabase
+Choix de la couleur de curseur
+Déconnexion et gestion de session
+
+### v0.1.12 (02/05/2025)
+Système de remboursements avec historique
+Undo/Redo pour les remboursements
+Export des tickets en CSV
+Améliorations du dashboard
+
 ## 7. Patch notes 0.1.20
 
 - Ajout du panel Admin (acces restreint aux admins)

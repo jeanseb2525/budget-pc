@@ -1,6 +1,6 @@
 [package]
 name = "budget-pc"
-version = "0.1.20"
+version = "0.1.21"
 description = "A Tauri App"
 authors = ["Jean-Sebastien"]
 edition = "2021"
