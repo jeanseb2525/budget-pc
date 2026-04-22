@@ -951,31 +951,7 @@ type AdminPermissionViewKey =
   | "version"
   | "admin";
 
-const _adminPermissionLabels: Record<AdminPermissionViewKey, string> = {
-  dashboard: "Dashboard",
-  tickets: "Tickets",
-  annual: "Annuel",
-  audits: "Audits",
-  compare: "Comparateur",
-  subscriptions: "Abonnements",
-  collab: "Collab",
-  settings: "Paramètres",
-  version: "Version",
-  admin: "Admin",
-};
 
-const _adminPermissionKeys: AdminPermissionViewKey[] = [
-  "dashboard",
-  "tickets",
-  "annual",
-  "audits",
-  "compare",
-  "subscriptions",
-  "collab",
-  "settings",
-  "version",
-  "admin",
-];
 
 function getEditablePermissions(account: AccountProfile): AccountPagePermissions {
   if (account.role === "founder") {
@@ -994,23 +970,6 @@ function getEditablePermissions(account: AccountProfile): AccountPagePermissions
   }
 
   return { ...account.pagePermissions };
-}
-
-function _getAccountPermissionPreview(account: AccountProfile) {
-  const isAdminLike = account.role === "founder" || account.role === "admin";
-
-  return {
-    dashboard: true,
-    tickets: true,
-    annual: isAdminLike,
-    audits: isAdminLike,
-    compare: isAdminLike,
-    subscriptions: true,
-    collab: isAdminLike,
-    settings: true,
-    version: true,
-    admin: isAdminLike,
-  } satisfies Record<AdminPermissionViewKey, boolean>;
 }
 
 function canAccessPage(account: AccountProfile, page: PageKey) {
@@ -6829,15 +6788,7 @@ function App() {
   const [page, setPage] = useState<PageKey>(getInitialPage);
   const [currentAccount, setCurrentAccount] = useState<AccountProfile | null>(loadStoredSessionAccount);
 
-  const _visiblePageKeys = useMemo(
-    () =>
-      currentAccount
-        ? pageKeys.filter((pageKey) => canAccessPage(currentAccount, pageKey))
-        : [],
-    [currentAccount]
-  );
 
-  
 
   const [authMode, setAuthMode] = useState<AuthMode>("signin");
   const [authLoading, setAuthLoading] = useState(false);
