@@ -6,7 +6,6 @@ import {
   useEffect,
   useRef,
   useState,
-  useMemo,
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { createPortal } from "react-dom";
@@ -939,20 +938,6 @@ function getPageLabel(page: PageKey) {
   return pageMeta[page].title;
 }
 
-type AdminPermissionViewKey =
-  | "dashboard"
-  | "tickets"
-  | "annual"
-  | "audits"
-  | "compare"
-  | "subscriptions"
-  | "collab"
-  | "settings"
-  | "version"
-  | "admin";
-
-
-
 function getEditablePermissions(account: AccountProfile): AccountPagePermissions {
   if (account.role === "founder") {
     return {
@@ -970,18 +955,6 @@ function getEditablePermissions(account: AccountProfile): AccountPagePermissions
   }
 
   return { ...account.pagePermissions };
-}
-
-function canAccessPage(account: AccountProfile, page: PageKey) {
-  if (account.role === "founder") {
-    return true;
-  }
-
-  if (page === "admin") {
-    return account.role === "admin" || account.pagePermissions.admin;
-  }
-
-  return account.pagePermissions[page] ?? false;
 }
 
 function getTicketKey(ticket: Ticket) {
