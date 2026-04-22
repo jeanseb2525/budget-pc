@@ -6,6 +6,7 @@ import {
   useEffect,
   useRef,
   useState,
+  useMemo,
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { createPortal } from "react-dom";
@@ -30,6 +31,8 @@ type Ticket = {
   amount: number;
   sent: boolean;
   sortIndex?: number;
+  sheetRow?: number;
+  blockIndex?: number;
 };
 
 type TicketMonthSummary = {
@@ -110,6 +113,19 @@ type TicketBudgetComputedLine = TicketBudgetLine & {
   difference: number;
 };
 
+type AccountPagePermissions = {
+  dashboard: boolean;
+  tickets: boolean;
+  annual: boolean;
+  audits: boolean;
+  compare: boolean;
+  subscriptions: boolean;
+  collab: boolean;
+  settings: boolean;
+  version: boolean;
+  admin: boolean;
+};
+
 type AccountProfile = {
   id: string;
   email: string;
@@ -119,8 +135,35 @@ type AccountProfile = {
   cursorColor: string;
   createdAt: string;
   passwordHash?: string;
-  role: "admin" | "user";
+  role: "founder" | "admin" | "user";
+  pagePermissions: AccountPagePermissions;
   sessionToken: string;
+};
+
+const defaultUserPagePermissions: AccountPagePermissions = {
+  dashboard: true,
+  tickets: true,
+  annual: false,
+  audits: false,
+  compare: false,
+  subscriptions: true,
+  collab: false,
+  settings: true,
+  version: true,
+  admin: false,
+};
+
+const defaultAdminPagePermissions: AccountPagePermissions = {
+  dashboard: true,
+  tickets: true,
+  annual: true,
+  audits: true,
+  compare: true,
+  subscriptions: true,
+  collab: true,
+  settings: true,
+  version: true,
+  admin: true,
 };
 
 type AuthMode = "signin" | "signup";
@@ -162,6 +205,85 @@ type AvailableUpdate = {
   currentVersion: string;
   notes?: string | null;
   pubDate?: string | null;
+};
+
+type CompareMonthState = {
+  tickets: Ticket[];
+  summary: TicketMonthSummary | null;
+  loading: boolean;
+  error: string;
+  syncedAt: number | null;
+};
+
+type MonthDataCacheEntry = {
+  tickets: Ticket[];
+  summary: TicketMonthSummary;
+  reimbursements: ReimbursementDetails;
+  syncedAt: number;
+};
+
+type CompareSortMode = "delta" | "primary" | "secondary";
+
+type UnexpectedSpendTicket = {
+  ticket: Ticket;
+  reason: string;
+};
+
+type AuditSeverity = "critical" | "warning" | "ok";
+
+type AuditAlert = {
+  id: string;
+  severity: AuditSeverity;
+  icon: string;
+  title: string;
+  detail: string;
+  amount?: number;
+};
+
+type AuditFlaggedTicket = {
+  key: string;
+  ticket: Ticket;
+  severity: AuditSeverity;
+  reason: string;
+};
+
+type AuditRecurringCandidate = {
+  key: string;
+  label: string;
+  category: string;
+  currentAmount: number;
+  referenceAmount: number;
+  delta: number;
+  currentCount: number;
+  referenceCount: number;
+  tracked: boolean;
+  trackedLabel: string;
+};
+
+type AuditCategoryDelta = {
+  category: string;
+  currentAmount: number;
+  referenceAmount: number;
+  delta: number;
+  currentCount: number;
+  referenceCount: number;
+};
+
+type AuditReport = {
+  score: number;
+  statusLabel: string;
+  statusTone: AuditSeverity;
+  alerts: AuditAlert[];
+  flaggedTickets: AuditFlaggedTicket[];
+  recurringCandidates: AuditRecurringCandidate[];
+  categoryDeltas: AuditCategoryDelta[];
+  underWatchTotal: number;
+  criticalCount: number;
+  warningCount: number;
+  okCount: number;
+  duplicateGroupCount: number;
+  outlierCount: number;
+  untrackedRecurringCount: number;
 };
 
 type HistorySnapshot = {
@@ -292,6 +414,11 @@ type CollabMessage =
 
 type VoiceStep = "date" | "amount" | "description" | "confirm";
 
+type TicketFollowUpPrompt = {
+  keepDate: string;
+  voiceEnabled: boolean;
+};
+
 type SpeechRecognitionAlternativeLike = {
   transcript: string;
 };
@@ -385,27 +512,45 @@ const categoryOptions = [
 const ticketsFinancePreset = {
   monthlyIncome: 2200,
   budgetLines: [
-    { key: "courses", label: "Courses", planned: 350, matchCategories: [categoryOptions[0]] },
+    { key: "courses", label: "Courses", planned: 600, matchCategories: [categoryOptions[0]] },
     { key: "fast_food", label: "Fast-Food / Livraison", planned: 140, matchCategories: [categoryOptions[1], categoryOptions[3]] },
     { key: "restaurant", label: "Restaurant", planned: 120, matchCategories: [categoryOptions[2]] },
-    { key: "telephonie", label: "Téléphonie", planned: 20, matchCategories: [categoryOptions[4]] },
-    { key: "netflix", label: "Netflix", planned: 14, matchCategories: [categoryOptions[5]] },
-    { key: "amazon_prime", label: "Amazon Prime", planned: 7, matchCategories: [categoryOptions[6]] },
-    { key: "apple_spotify", label: "Apple / Spotify", planned: 18, matchCategories: [categoryOptions[7]] },
+    { key: "telephonie", label: "Téléphonie", planned: 109, matchCategories: [categoryOptions[4]] },
+    { key: "netflix", label: "Netflix", planned: 21.99, matchCategories: [categoryOptions[5]] },
+    { key: "amazon_prime", label: "Amazon Prime", planned: 6.99, matchCategories: [categoryOptions[6]] },
+    { key: "apple_spotify", label: "Apple / Spotify", planned: 19.18, matchCategories: [categoryOptions[7]] },
     { key: "quotidien", label: "Quotidien", planned: 120, matchCategories: [categoryOptions[8]] },
     { key: "essence", label: "Essence", planned: 180, matchCategories: [categoryOptions[9]] },
     { key: "autres", label: "Autres", planned: 90, matchCategories: [categoryOptions[10]] },
   ] satisfies TicketBudgetLine[],
 };
 
-const voiceHints = [
-  "Date: aujourd'hui, hier, 12 avril ou 12/04/2026",
-  "Montant: 18 euros 50 ou 18,50",
-  "Description: Carrefour, Netflix, Burger King",
-  "Confirmation: dis valider, recommencer ou annuler",
-];
+const unexpectedSpendSheetCategories = [
+  "⚕️ Medecin",
+  "🚲 Uber eats",
+  "🍔 Fast-Food",
+  "🍽️Restaurant",
+  "📦Cmd. Amazon",
+  "🎁Cadeaux",
+  "🚃Transport",
+  "🕹️Jeux",
+  "👖Vêtements",
+  "🧺Quotidien",
+  "🛠️Voiture",
+  "❓ Autres",
+  "✈️ Voyage",
+] as const;
+
 
 const voiceStepOrder: VoiceStep[] = ["date", "amount", "description", "confirm"];
+const voiceCommandKeywords = {
+  confirm: ["valider", "valide", "validee"],
+  edit: ["modifier", "modifie", "modifiee"],
+  restart: ["recommencer", "recommence"],
+  cancel: ["annuler", "annule"],
+  yes: ["oui", "ouais", "encore", "continuer"],
+  no: ["non", "stop", "terminer", "arreter", "arrêter"],
+} as const;
 
 const spokenMonthMap: Record<string, string> = {
   janvier: "01",
@@ -426,30 +571,37 @@ const spokenMonthMap: Record<string, string> = {
 };
 
 const categoryKeywords: Array<{ category: string; keywords: string[] }> = [
-  {
-    category: categoryOptions[0],
-    keywords: ["carrefour", "auchan", "super u", "courses", "alimentation", "lidl"],
-  },
-  {
-    category: categoryOptions[1],
-    keywords: ["fast food", "burger", "kfc", "mcdo", "burger king", "subway"],
-  },
-  {
-    category: categoryOptions[2],
-    keywords: ["restaurant", "resto", "brasserie", "pizzeria"],
-  },
-  {
-    category: categoryOptions[3],
-    keywords: ["uber eats", "livraison", "deliveroo"],
-  },
-  {
-    category: categoryOptions[4],
-    keywords: ["sfr", "telephonie", "telephone", "forfait"],
-  },
-  { category: categoryOptions[5], keywords: ["netflix"] },
-  { category: categoryOptions[6], keywords: ["amazon prime", "prime video"] },
-  { category: categoryOptions[7], keywords: ["spotify", "apple", "itunes", "apple music"] },
-  { category: categoryOptions[8], keywords: ["quotidien", "pharmacie", "maison", "entretien"] },
+  { category: "🏠 Loyer", keywords: ["loyer"] },
+  { category: "💡 Electricité", keywords: ["edf", "electricite", "électricité"] },
+  { category: "🛒 Courses", keywords: ["course", "courses", "carrefour", "leclerc", "intermarché", "intermarche", "auchan", "lidl", "aldi", "super u", "superu", "monoprix"] },
+  { category: "🛡️ Assurance", keywords: ["maaf", "assurance"] },
+  { category: "📱 Téléphonie", keywords: ["sfr", "orange", "free mobile", "bouygues", "telephonie", "telephone", "forfait"] },
+  { category: "🍏 Apple / Spotify", keywords: ["spotify", "apple", "icloud", "app store", "itunes", "apple music"] },
+  { category: "⛽ Essence", keywords: ["essence", "station", "total", "totalenergies", "shell"] },
+  { category: "🏋️ Sport", keywords: ["sport", "basic fit", "salle"] },
+  { category: "💅 Ongle", keywords: ["ongle"] },
+  { category: "💇 Coiffeur", keywords: ["coiffeur", "barbier"] },
+  { category: "🎬 Netflix", keywords: ["netflix"] },
+  { category: "🟢 Epargne Secours", keywords: ["secours"] },
+  { category: "🔵 Epargne Maaf", keywords: ["maaf vie"] },
+  { category: "🚚 Amazon Prime", keywords: ["amazon prime", "prime video"] },
+  { category: "💳 Carte Revolut", keywords: ["carte revolut", "revolut"] },
+  { category: "🎮 Discord", keywords: ["discord"] },
+  { category: "🚬 CE", keywords: ["gout ce", "colis raf", "ce"] },
+  { category: "⚕️ Medecin", keywords: ["pharmacie", "doctolib", "medecin", "médecin", "dentiste", "chirurgien"] },
+  { category: "🚲 Uber eats", keywords: ["uber eats", "ubereats", "deliveroo"] },
+  { category: "🍔 Fast-Food", keywords: ["mcdo", "mcdonald", "burger king", "kfc", "subway", "fast food", "burger"] },
+  { category: "🍽️Restaurant", keywords: ["restaurant", "resto", "brasserie", "pizzeria"] },
+  { category: "📦Cmd. Amazon", keywords: ["amazon"] },
+  { category: "🎁Cadeaux", keywords: ["cadeau", "cadeaux"] },
+  { category: "🚃Transport", keywords: ["sncf", "ratp", "péage", "peage", "bus", "train", "tram", "parking", "transport"] },
+  { category: "🕹️Jeux", keywords: ["steam", "playstation", "xbox", "jeu", "jeux"] },
+  { category: "👖Vêtements", keywords: ["vetement", "vêtement", "habille", "zara", "hm", "celio"] },
+  { category: "🧺Quotidien", keywords: ["quotidien"] },
+  { category: "🛠️Voiture", keywords: ["garage", "vidange", "pneu", "midas", "norauto", "feu vert", "voiture"] },
+  { category: "🔁 Paiement 4x", keywords: ["4x", "paiement 4 fois", "paiement 4x"] },
+  { category: "✈️ Voyage", keywords: ["voyage", "avion", "hotel", "hôtel", "booking"] },
+  { category: "💸Épargne", keywords: ["epargne", "épargne"] },
 ];
 
 // @ts-expect-error reserved for future use
@@ -597,6 +749,42 @@ function normalizeAccountProfile(data: unknown): AccountProfile | null {
     return null;
   }
 
+  const role: "founder" | "admin" | "user" =
+    email === FOUNDER_EMAIL
+      ? "founder"
+      : row.role === "founder"
+        ? "founder"
+        : row.role === "admin"
+          ? "admin"
+          : "user";
+
+  const fallbackPermissions =
+    role === "founder" || role === "admin"
+      ? defaultAdminPagePermissions
+      : defaultUserPagePermissions;
+
+  const rawPermissions =
+    row.pagePermissions && typeof row.pagePermissions === "object"
+      ? (row.pagePermissions as Record<string, unknown>)
+      : row.page_permissions && typeof row.page_permissions === "object"
+        ? (row.page_permissions as Record<string, unknown>)
+        : null;
+
+  const pagePermissions: AccountPagePermissions = rawPermissions
+    ? {
+        dashboard: Boolean(rawPermissions.dashboard ?? fallbackPermissions.dashboard),
+        tickets: Boolean(rawPermissions.tickets ?? fallbackPermissions.tickets),
+        annual: Boolean(rawPermissions.annual ?? fallbackPermissions.annual),
+        audits: Boolean(rawPermissions.audits ?? fallbackPermissions.audits),
+        compare: Boolean(rawPermissions.compare ?? fallbackPermissions.compare),
+        subscriptions: Boolean(rawPermissions.subscriptions ?? fallbackPermissions.subscriptions),
+        collab: Boolean(rawPermissions.collab ?? fallbackPermissions.collab),
+        settings: Boolean(rawPermissions.settings ?? fallbackPermissions.settings),
+        version: Boolean(rawPermissions.version ?? fallbackPermissions.version),
+        admin: Boolean(rawPermissions.admin ?? fallbackPermissions.admin),
+      }
+    : fallbackPermissions;
+
   return {
     id: String(row.id ?? row.userId ?? row.uuid ?? email),
     email,
@@ -606,7 +794,8 @@ function normalizeAccountProfile(data: unknown): AccountProfile | null {
     cursorColor: String(row.cursorColor ?? row.cursor_color ?? row.color ?? collabColors[0]),
     createdAt: String(row.createdAt ?? row.created_at ?? new Date().toISOString()),
     passwordHash: typeof row.passwordHash === "string" ? row.passwordHash : undefined,
-    role: (row as Record<string, unknown>).role === "admin" ? "admin" : "user",
+    role,
+    pagePermissions,
     sessionToken: String(row.sessionToken ?? row.session_token ?? ""),
   };
 }
@@ -748,6 +937,92 @@ function upsertCollaboratorEntry(current: Collaborator[], next: Collaborator) {
 
 function getPageLabel(page: PageKey) {
   return pageMeta[page].title;
+}
+
+type AdminPermissionViewKey =
+  | "dashboard"
+  | "tickets"
+  | "annual"
+  | "audits"
+  | "compare"
+  | "subscriptions"
+  | "collab"
+  | "settings"
+  | "version"
+  | "admin";
+
+const adminPermissionLabels: Record<AdminPermissionViewKey, string> = {
+  dashboard: "Dashboard",
+  tickets: "Tickets",
+  annual: "Annuel",
+  audits: "Audits",
+  compare: "Comparateur",
+  subscriptions: "Abonnements",
+  collab: "Collab",
+  settings: "Paramètres",
+  version: "Version",
+  admin: "Admin",
+};
+
+const adminPermissionKeys: AdminPermissionViewKey[] = [
+  "dashboard",
+  "tickets",
+  "annual",
+  "audits",
+  "compare",
+  "subscriptions",
+  "collab",
+  "settings",
+  "version",
+  "admin",
+];
+
+function getEditablePermissions(account: AccountProfile): AccountPagePermissions {
+  if (account.role === "founder") {
+    return {
+      dashboard: true,
+      tickets: true,
+      annual: true,
+      audits: true,
+      compare: true,
+      subscriptions: true,
+      collab: true,
+      settings: true,
+      version: true,
+      admin: true,
+    };
+  }
+
+  return { ...account.pagePermissions };
+}
+
+function getAccountPermissionPreview(account: AccountProfile) {
+  const isAdminLike = account.role === "founder" || account.role === "admin";
+
+  return {
+    dashboard: true,
+    tickets: true,
+    annual: isAdminLike,
+    audits: isAdminLike,
+    compare: isAdminLike,
+    subscriptions: true,
+    collab: isAdminLike,
+    settings: true,
+    version: true,
+    admin: isAdminLike,
+  } satisfies Record<AdminPermissionViewKey, boolean>;
+}
+
+function canAccessPage(account: AccountProfile, page: PageKey) {
+  if (account.role === "founder") {
+    return true;
+  }
+
+  if (page === "admin") {
+    return account.role === "admin" || account.pagePermissions.admin;
+  }
+
+  return account.pagePermissions[page] ?? false;
 }
 
 function getTicketKey(ticket: Ticket) {
@@ -899,6 +1174,8 @@ function normalizeTickets(data: unknown): Ticket[] {
           sortIndex: toNumber(
             row.sortIndex ?? row.rowIndex ?? row.row ?? row.position ?? row.index ?? Number.NaN
           ),
+          sheetRow: toNumber(row.sheetRow ?? Number.NaN),
+          blockIndex: toNumber(row.blockIndex ?? Number.NaN),
         };
       });
     }
@@ -933,6 +1210,8 @@ function normalizeTickets(data: unknown): Ticket[] {
       sortIndex: toNumber(
         row.sortIndex ?? row.rowIndex ?? row.row ?? row.position ?? row.index ?? Number.NaN
       ),
+      sheetRow: toNumber(row.sheetRow ?? Number.NaN),
+      blockIndex: toNumber(row.blockIndex ?? Number.NaN),
     };
   });
 }
@@ -966,6 +1245,11 @@ function normalizeVoiceCommand(value: string) {
     .trim();
 }
 
+function hasVoiceKeyword(transcript: string, keywords: readonly string[]) {
+  const normalized = normalizeVoiceCommand(transcript);
+  return keywords.some((keyword) => normalized.includes(normalizeVoiceCommand(keyword)));
+}
+
 function inferCategoryFromTranscript(transcript: string) {
   const normalized = normalizeVoiceCommand(transcript);
 
@@ -975,7 +1259,20 @@ function inferCategoryFromTranscript(transcript: string) {
     }
   }
 
-  return categoryOptions[9];
+  return "";
+}
+
+function inferCategoryFromDescription(description: string) {
+  const normalized = normalizeText(description.trim());
+  if (!normalized) return "";
+
+  for (const rule of categoryKeywords) {
+    if (rule.keywords.some((keyword) => normalized.includes(normalizeText(keyword)))) {
+      return rule.category;
+    }
+  }
+
+  return "";
 }
 
 function inferAmountFromTranscript(transcript: string) {
@@ -1021,7 +1318,7 @@ function toTitleCase(value: string) {
 function cleanDescriptionTranscript(transcript: string) {
   return toTitleCase(
     transcript
-      .replace(/\b(valider|recommencer|annuler)\b/gi, " ")
+      .replace(/\b(valider|valide|validee|validée|modifier|modifie|modifiee|modifiée|recommencer|recommence|annuler|annule)\b/gi, " ")
       .replace(/\s+/g, " ")
       .trim()
   );
@@ -1038,7 +1335,13 @@ function getVoiceStepPrompt(step: VoiceStep, form: NewTicketForm) {
   if (step === "date") return "Dis la date du ticket. Exemple: aujourd'hui ou 12 avril.";
   if (step === "amount") return "Dis le montant. Exemple: 18 euros 50.";
   if (step === "description") return "Dis la description. Exemple: Carrefour ou Netflix.";
-  return `Verifie le recap puis dis valider, recommencer ou annuler.${form.category ? ` Categorie detectee: ${form.category}.` : ""}`;
+  return form.category
+    ? `Verifie le recap puis dis valider, modifier ou annuler. Categorie detectee: ${form.category}.`
+    : "Verifie le recap. Si la categorie n a pas ete trouvee, choisis-la puis dis valider, modifier ou annuler.";
+}
+
+function getAnotherTicketVoicePrompt() {
+  return "Ticket enregistre. Veux-tu ajouter un autre ticket ? Dis oui ou non.";
 }
 
 function formatVoiceDate(transcript: string) {
@@ -1138,11 +1441,41 @@ function getTicketSortIndex(ticket: Ticket) {
   return Number.isFinite(ticket.sortIndex) ? (ticket.sortIndex as number) : Number.MAX_SAFE_INTEGER;
 }
 
-function getTicketCategoryChoices(tickets: Ticket[]) {
-  return [...new Set(tickets.map((ticket) => ticket.category.trim()).filter(Boolean))].sort((a, b) =>
-    a.localeCompare(b, "fr")
-  );
-}
+const SHEET_ALL_CATEGORIES = [
+  "🏠 Loyer",
+  "💡 Electricité",
+  "🛒 Courses",
+  "🛡️ Assurance",
+  "📱 Téléphonie",
+  "🍏 Apple / Spotify",
+  "⛽ Essence",
+  "🏋️ Sport",
+  "💅 Ongle",
+  "💇 Coiffeur",
+  "🎬 Netflix",
+  "🟢 Epargne Secours",
+  "🔵 Epargne Maaf",
+  "🚚 Amazon Prime",
+  "💳 Carte Revolut",
+  "🎮 Discord",
+  "🚬 CE",
+  "⚕️ Medecin",
+  "🚲 Uber eats",
+  "🍔 Fast-Food",
+  "🍽️Restaurant",
+  "📦Cmd. Amazon",
+  "🎁Cadeaux",
+  "🚃Transport",
+  "🕹️Jeux",
+  "👖Vêtements",
+  "🧺Quotidien",
+  "🛠️Voiture",
+  "❓ Autres",
+  "🔁 Paiement 4x",
+  "✈️ Voyage",
+  "💸Épargne",
+];
+
 
 function filterAndSortTickets(
   tickets: Ticket[],
@@ -1274,6 +1607,24 @@ async function createTicketInSheets(selectedMonth: string, form: NewTicketForm) 
   });
 }
 
+async function updateTicketInSheets(
+  selectedMonth: string,
+  sheetRow: number,
+  blockIndex: number,
+  form: { date: string; amount: string; description: string; category: string }
+) {
+  return postSheetsAction({
+    action: "updateTicket",
+    mois: getApiMonthName(selectedMonth),
+    sheetRow,
+    blockIndex,
+    date: form.date,
+    montant: form.amount,
+    description: form.description,
+    categorie: form.category,
+  });
+}
+
 function createEmptyReimbursementLine(): ReimbursementFormLine {
   return {
     category: "",
@@ -1388,6 +1739,7 @@ async function signUpAccountInSheets(form: SignUpForm) {
     lastName: form.lastName.trim(),
     pseudo: form.pseudo.trim(),
     cursorColor: form.cursorColor,
+    pagePermissions: defaultUserPagePermissions,
   })) as { success?: boolean; error?: string; account?: unknown; user?: unknown; profile?: unknown };
 
   if (response?.success === false) {
@@ -1454,6 +1806,12 @@ async function fetchAllUsersFromSheets(adminEmail: string, sessionToken: string)
   return rawAccounts
     .map((a) => normalizeAccountProfile(a))
     .filter((a): a is AccountProfile => a !== null);
+}
+
+const FOUNDER_EMAIL = "schjeanseb@gmail.com";
+
+function isPrivileged(account: AccountProfile) {
+  return account.role === "founder" || account.role === "admin";
 }
 
 async function updateUserRoleInSheets(
@@ -1679,6 +2037,144 @@ function getSelectedMonthLabel(selectedMonth: string) {
   return monthOptions.find((month) => month.value === selectedMonth)?.label ?? selectedMonth;
 }
 
+function createEmptyCompareMonthState(): CompareMonthState {
+  return {
+    tickets: [],
+    summary: null,
+    loading: false,
+    error: "",
+    syncedAt: null,
+  };
+}
+
+function createEmptyReimbursementDetails(): ReimbursementDetails {
+  return {
+    entries: [],
+    ceTotal: 0,
+    medecinTotal: 0,
+    total: 0,
+  };
+}
+
+function getRelativeMonthValue(baseMonth: string, offset: number) {
+  const index = monthOptions.findIndex((month) => month.value === baseMonth);
+
+  if (index === -1) {
+    return monthOptions[0]?.value ?? "01";
+  }
+
+  return monthOptions[(index + offset + monthOptions.length) % monthOptions.length]?.value ?? baseMonth;
+}
+
+function buildFallbackTicketMonthSummary(tickets: Ticket[]): TicketMonthSummary {
+  const monthlyTotal = tickets.reduce((sum, ticket) => sum + ticket.amount, 0);
+  const budgetLines = computeTicketBudgetLines(tickets);
+  const budgetPlannedTotal = budgetLines.reduce((sum, line) => sum + line.planned, 0);
+  const currentRemaining = ticketsFinancePreset.monthlyIncome - monthlyTotal;
+  const theoreticalRemaining = ticketsFinancePreset.monthlyIncome - budgetPlannedTotal;
+
+  return {
+    accountBalance: null,
+    currentRemaining,
+    theoreticalRemaining,
+    unexpectedSpendTotal: currentRemaining - theoreticalRemaining,
+    source: "fallback",
+  };
+}
+
+function normalizeMonthDataPayload(data: unknown): {
+  tickets: Ticket[];
+  summary: TicketMonthSummary;
+  reimbursements: ReimbursementDetails;
+} {
+  const tickets = normalizeTickets(data);
+  const summary =
+    normalizeTicketMonthSummary(data) ?? buildFallbackTicketMonthSummary(tickets);
+  const reimbursements = normalizeReimbursementDetails(data);
+
+  return {
+    tickets,
+    summary,
+    reimbursements,
+  };
+}
+
+function formatElapsedSyncDuration(elapsedSeconds: number) {
+  if (elapsedSeconds < 60) {
+    return `${elapsedSeconds} sec`;
+  }
+
+  if (elapsedSeconds < 3600) {
+    const minutes = Math.floor(elapsedSeconds / 60);
+    const seconds = elapsedSeconds % 60;
+    return `${minutes} min ${String(seconds).padStart(2, "0")}`;
+  }
+
+  if (elapsedSeconds < 86400) {
+    const hours = Math.floor(elapsedSeconds / 3600);
+    const minutes = Math.floor((elapsedSeconds % 3600) / 60);
+    return `${hours} h ${String(minutes).padStart(2, "0")} min`;
+  }
+
+  const days = Math.floor(elapsedSeconds / 86400);
+  const hours = Math.floor((elapsedSeconds % 86400) / 3600);
+  return `${days} j ${String(hours).padStart(2, "0")} h`;
+}
+
+function formatRelativeSyncAge(syncedAt: number, now: number) {
+  const elapsedSeconds = Math.max(0, Math.floor((now - syncedAt) / 1000));
+  return `il y a ${formatElapsedSyncDuration(elapsedSeconds)}`;
+}
+
+type LiveRelativeSyncLabelProps = {
+  syncedAt: number | null;
+  loading?: boolean;
+  loadingLabel?: string;
+  waitingLabel?: string;
+  prefix?: string;
+};
+
+function LiveRelativeSyncLabel({
+  syncedAt,
+  loading = false,
+  loadingLabel = "Synchro en cours...",
+  waitingLabel = "Synchro en attente",
+  prefix = "Synchro",
+}: LiveRelativeSyncLabelProps) {
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    if (!loading && syncedAt === null) {
+      return;
+    }
+
+    setNow(Date.now());
+    const interval = window.setInterval(() => {
+      setNow(Date.now());
+    }, 1000);
+
+    return () => {
+      window.clearInterval(interval);
+    };
+  }, [loading, syncedAt]);
+
+  if (loading) {
+    return <>{loadingLabel}</>;
+  }
+
+  if (!syncedAt) {
+    return <>{waitingLabel}</>;
+  }
+
+  const label = formatRelativeSyncAge(syncedAt, now);
+
+  return <>{prefix ? `${prefix} ${label}` : label}</>;
+}
+
 function computeTicketBudgetLines(tickets: Ticket[]): TicketBudgetComputedLine[] {
   return ticketsFinancePreset.budgetLines.map((line) => {
     const actual = tickets
@@ -1703,6 +2199,558 @@ function getBudgetDifferenceTone(value: number) {
   if (value > 0.009) return "warn";
   if (value < -0.009) return "ok";
   return "neutral";
+}
+
+function buildCompareMonthMetrics(
+  tickets: Ticket[],
+  summary: TicketMonthSummary | null
+) {
+  const total = tickets.reduce((sum, ticket) => sum + ticket.amount, 0);
+  const sentCount = tickets.filter((ticket) => ticket.sent).length;
+  const pendingCount = tickets.length - sentCount;
+  const averageTicket = tickets.length > 0 ? total / tickets.length : 0;
+  const budgetLines = computeTicketBudgetLines(tickets);
+  const plannedTotal = budgetLines.reduce((sum, line) => sum + line.planned, 0);
+  const fallbackSummary = buildFallbackTicketMonthSummary(tickets);
+  const currentRemaining =
+    summary?.currentRemaining ?? fallbackSummary.currentRemaining ?? ticketsFinancePreset.monthlyIncome - total;
+  const theoreticalRemaining =
+    summary?.theoreticalRemaining ??
+    fallbackSummary.theoreticalRemaining ??
+    ticketsFinancePreset.monthlyIncome - plannedTotal;
+  const unexpectedSpend =
+    summary?.unexpectedSpendTotal ?? currentRemaining - theoreticalRemaining;
+  const largestTicket =
+    [...tickets].sort((left, right) => right.amount - left.amount)[0] ?? null;
+
+  return {
+    total,
+    ticketCount: tickets.length,
+    sentCount,
+    pendingCount,
+    sentRatio: tickets.length > 0 ? (sentCount / tickets.length) * 100 : 0,
+    averageTicket,
+    budgetLines,
+    plannedTotal,
+    currentRemaining,
+    theoreticalRemaining,
+    unexpectedSpend,
+    largestTicket,
+    budgetUsagePercent:
+      ticketsFinancePreset.monthlyIncome > 0
+        ? Math.min(100, (total / ticketsFinancePreset.monthlyIncome) * 100)
+        : 0,
+  };
+}
+
+function buildTicketCategoryMap(tickets: Ticket[]) {
+  const totals = new Map<string, { amount: number; count: number }>();
+
+  tickets.forEach((ticket) => {
+    const key = ticket.category.trim() || "Sans categorie";
+    const current = totals.get(key) ?? { amount: 0, count: 0 };
+    totals.set(key, {
+      amount: current.amount + ticket.amount,
+      count: current.count + 1,
+    });
+  });
+
+  return totals;
+}
+
+function buildCategoryCompareRows(
+  primaryTickets: Ticket[],
+  secondaryTickets: Ticket[],
+  sortMode: CompareSortMode
+) {
+  const primaryMap = buildTicketCategoryMap(primaryTickets);
+  const secondaryMap = buildTicketCategoryMap(secondaryTickets);
+  const categories = new Set([...primaryMap.keys(), ...secondaryMap.keys()]);
+
+  const rows = [...categories]
+    .map((category) => {
+      const primary = primaryMap.get(category) ?? { amount: 0, count: 0 };
+      const secondary = secondaryMap.get(category) ?? { amount: 0, count: 0 };
+      const delta = primary.amount - secondary.amount;
+
+      return {
+        category,
+        primaryAmount: primary.amount,
+        secondaryAmount: secondary.amount,
+        primaryCount: primary.count,
+        secondaryCount: secondary.count,
+        delta,
+        absoluteDelta: Math.abs(delta),
+      };
+    })
+    .filter((row) => row.primaryAmount > 0.009 || row.secondaryAmount > 0.009);
+
+  rows.sort((left, right) => {
+    if (sortMode === "primary") {
+      return (
+        right.primaryAmount - left.primaryAmount ||
+        right.absoluteDelta - left.absoluteDelta ||
+        left.category.localeCompare(right.category, "fr")
+      );
+    }
+
+    if (sortMode === "secondary") {
+      return (
+        right.secondaryAmount - left.secondaryAmount ||
+        right.absoluteDelta - left.absoluteDelta ||
+        left.category.localeCompare(right.category, "fr")
+      );
+    }
+
+    return (
+      right.absoluteDelta - left.absoluteDelta ||
+      right.primaryAmount - left.primaryAmount ||
+      left.category.localeCompare(right.category, "fr")
+    );
+  });
+
+  return rows;
+}
+
+function buildUnexpectedSpendTickets(tickets: Ticket[]): UnexpectedSpendTicket[] {
+  const categoryOrder = new Map<string, number>(
+    unexpectedSpendSheetCategories.map((category, index) => [category, index])
+  );
+
+  return tickets
+    .filter((ticket) => categoryOrder.has(ticket.category))
+    .map((ticket) => ({
+      ticket,
+      reason: "Categorie non prevue du sheet",
+    }))
+    .sort((left, right) => {
+      const categoryDelta =
+        (categoryOrder.get(left.ticket.category) ?? 999) -
+        (categoryOrder.get(right.ticket.category) ?? 999);
+
+      if (categoryDelta !== 0) {
+        return categoryDelta;
+      }
+
+      const dateDelta = getTicketDateValue(right.ticket) - getTicketDateValue(left.ticket);
+      if (dateDelta !== 0) {
+        return dateDelta;
+      }
+
+      return right.ticket.amount - left.ticket.amount;
+    });
+}
+
+function buildUnexpectedSpendCategoryTotals(tickets: Ticket[]) {
+  const totals = new Map<string, { category: string; total: number; count: number }>();
+
+  unexpectedSpendSheetCategories.forEach((category) => {
+    totals.set(category, { category, total: 0, count: 0 });
+  });
+
+  tickets.forEach((ticket) => {
+    if (!totals.has(ticket.category)) {
+      return;
+    }
+
+    const current = totals.get(ticket.category)!;
+    current.total += ticket.amount;
+    current.count += 1;
+  });
+
+  return unexpectedSpendSheetCategories
+    .map((category) => totals.get(category)!)
+    .filter((entry) => entry.total > 0.009);
+}
+
+function clampNumber(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function getAuditSeverityRank(severity: AuditSeverity) {
+  if (severity === "critical") return 3;
+  if (severity === "warning") return 2;
+  return 1;
+}
+
+function normalizeAuditDescription(value: string) {
+  return normalizeText(value)
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(
+      /\b(cb|carte|visa|mastercard|paiement|payment|facture|prelevement|prlv|achat|transaction)\b/g,
+      " "
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isCloseAmount(left: number, right: number, tolerance: number) {
+  return Math.abs(left - right) <= tolerance;
+}
+
+function getGroupDateSpreadInDays(tickets: Ticket[]) {
+  const dates = tickets
+    .map((ticket) => getTicketDateValue(ticket))
+    .filter((value) => value > 0);
+
+  if (dates.length < 2) {
+    return 0;
+  }
+
+  return Math.round((Math.max(...dates) - Math.min(...dates)) / 86_400_000);
+}
+
+function dedupeAuditFlaggedTickets(items: AuditFlaggedTicket[]) {
+  const byTicket = new Map<string, AuditFlaggedTicket>();
+
+  items.forEach((item) => {
+    const existing = byTicket.get(item.key);
+
+    if (!existing || getAuditSeverityRank(item.severity) > getAuditSeverityRank(existing.severity)) {
+      byTicket.set(item.key, item);
+    }
+  });
+
+  return [...byTicket.values()].sort((left, right) => {
+    const severityDelta =
+      getAuditSeverityRank(right.severity) - getAuditSeverityRank(left.severity);
+
+    if (severityDelta !== 0) {
+      return severityDelta;
+    }
+
+    return right.ticket.amount - left.ticket.amount;
+  });
+}
+
+function buildAuditRecurringIndex(tickets: Ticket[]) {
+  const index = new Map<
+    string,
+    {
+      label: string;
+      category: string;
+      totalAmount: number;
+      count: number;
+    }
+  >();
+
+  tickets.forEach((ticket) => {
+    const rawLabel = ticket.description.trim() || ticket.category.trim() || "Sans libelle";
+    const key = normalizeAuditDescription(rawLabel);
+
+    if (!key) {
+      return;
+    }
+
+    const current = index.get(key) ?? {
+      label: rawLabel,
+      category: ticket.category || "Sans categorie",
+      totalAmount: 0,
+      count: 0,
+    };
+
+    index.set(key, {
+      label: current.label.length >= rawLabel.length ? current.label : rawLabel,
+      category: current.category || ticket.category || "Sans categorie",
+      totalAmount: current.totalAmount + ticket.amount,
+      count: current.count + 1,
+    });
+  });
+
+  return index;
+}
+
+function buildAuditReport(
+  currentTickets: Ticket[],
+  currentSummary: TicketMonthSummary | null,
+  referenceTickets: Ticket[],
+  subscriptions: DashboardSubscription[]
+): AuditReport {
+  const alerts: AuditAlert[] = [];
+  const flaggedTickets: AuditFlaggedTicket[] = [];
+  const currentMetrics = buildCompareMonthMetrics(currentTickets, currentSummary);
+  const categoryDeltas = buildCategoryCompareRows(currentTickets, referenceTickets, "delta").map(
+    (row) => ({
+      category: row.category,
+      currentAmount: row.primaryAmount,
+      referenceAmount: row.secondaryAmount,
+      delta: row.delta,
+      currentCount: row.primaryCount,
+      referenceCount: row.secondaryCount,
+    })
+  );
+
+  const outlierThreshold = Math.max(95, currentMetrics.averageTicket * 1.9);
+  const criticalOutlierThreshold = Math.max(180, currentMetrics.averageTicket * 2.6);
+  const outliers = [...currentTickets]
+    .filter((ticket) => ticket.amount >= outlierThreshold)
+    .sort((left, right) => right.amount - left.amount);
+
+  if (outliers.length > 0) {
+    const topOutlier = outliers[0];
+    const severity: AuditSeverity =
+      topOutlier.amount >= criticalOutlierThreshold ? "critical" : "warning";
+
+    alerts.push({
+      id: "outliers",
+      severity,
+      icon: severity === "critical" ? "!!" : "!",
+      title:
+        outliers.length === 1
+          ? "Ticket inhabituel detecte"
+          : `${outliers.length} tickets inhabituels`,
+      detail: `${topOutlier.description || "Sans description"} ressort a ${euro.format(topOutlier.amount)} pour un ticket moyen de ${euro.format(currentMetrics.averageTicket || 0)}.`,
+      amount: outliers.reduce((sum, ticket) => sum + ticket.amount, 0),
+    });
+
+    outliers.slice(0, 4).forEach((ticket) => {
+      flaggedTickets.push({
+        key: getTicketKey(ticket),
+        ticket,
+        severity,
+        reason: `Montant bien au-dessus du ticket moyen (${euro.format(currentMetrics.averageTicket || 0)}).`,
+      });
+    });
+  }
+
+  const duplicateGroups = [...currentTickets.reduce((map, ticket) => {
+    const normalizedLabel = normalizeAuditDescription(
+      ticket.description || ticket.category || "Sans libelle"
+    );
+
+    if (!normalizedLabel || normalizedLabel.length < 3) {
+      return map;
+    }
+
+    const key = `${normalizedLabel}__${ticket.amount.toFixed(2)}`;
+    const current = map.get(key) ?? [];
+    current.push(ticket);
+    map.set(key, current);
+    return map;
+  }, new Map<string, Ticket[]>()).values()]
+    .filter((group) => group.length > 1 && getGroupDateSpreadInDays(group) <= 10)
+    .sort((left, right) => right.length - left.length || right[0].amount - left[0].amount);
+
+  if (duplicateGroups.length > 0) {
+    const firstGroup = duplicateGroups[0];
+    const groupAmount = firstGroup.reduce((sum, ticket) => sum + ticket.amount, 0);
+
+    alerts.push({
+      id: "duplicates",
+      severity: duplicateGroups.length > 1 || firstGroup.length > 2 ? "critical" : "warning",
+      icon: "x2",
+      title:
+        duplicateGroups.length > 1
+          ? `${duplicateGroups.length} groupes de doublons probables`
+          : "Doublon probable a verifier",
+      detail: `${firstGroup[0]?.description || "Sans description"} revient ${firstGroup.length} fois sur une courte periode pour ${euro.format(firstGroup[0]?.amount ?? 0)}.`,
+      amount: groupAmount,
+    });
+
+    duplicateGroups.slice(0, 2).forEach((group) => {
+      group.forEach((ticket) => {
+        flaggedTickets.push({
+          key: getTicketKey(ticket),
+          ticket,
+          severity: "critical",
+          reason: "Description et montant repetes sur une courte fenetre.",
+        });
+      });
+    });
+  }
+
+  const topCategorySpike = categoryDeltas.find(
+    (row) => row.delta > Math.max(45, row.referenceAmount * 0.4)
+  );
+  const topCategoryRelief = categoryDeltas.find(
+    (row) => row.delta < -Math.max(35, row.referenceAmount * 0.35)
+  );
+
+  if (topCategorySpike) {
+    alerts.push({
+      id: "category-spike",
+      severity: topCategorySpike.delta > 110 ? "critical" : "warning",
+      icon: "UP",
+      title: `${topCategorySpike.category} tire le mois vers le haut`,
+      detail: `${formatBudgetDifference(topCategorySpike.delta)} par rapport a la periode de reference.`,
+      amount: topCategorySpike.currentAmount,
+    });
+  }
+
+  if (topCategoryRelief) {
+    alerts.push({
+      id: "category-relief",
+      severity: "ok",
+      icon: "OK",
+      title: `${topCategoryRelief.category} respire mieux`,
+      detail: `${formatBudgetDifference(Math.abs(topCategoryRelief.delta))} economises sur cette categorie.`,
+      amount: topCategoryRelief.currentAmount,
+    });
+  }
+
+  if (currentMetrics.unexpectedSpend > 25) {
+    alerts.push({
+      id: "unexpected-spend",
+      severity: currentMetrics.unexpectedSpend > 95 ? "critical" : "warning",
+      icon: "EUR",
+      title: "Depense non prevue au-dessus du rythme cible",
+      detail: `Le reel depasse le theorique de ${formatBudgetDifference(currentMetrics.unexpectedSpend)} sur ce mois.`,
+      amount: currentMetrics.unexpectedSpend,
+    });
+  }
+
+  if (currentMetrics.pendingCount >= 4 || currentMetrics.sentRatio < 60) {
+    alerts.push({
+      id: "pending",
+      severity: currentMetrics.pendingCount >= 7 ? "critical" : "warning",
+      icon: "CLK",
+      title: "Archivage des tickets a reprendre",
+      detail: `${currentMetrics.pendingCount} ticket(s) restent en attente, soit ${Math.round(currentMetrics.sentRatio)}% seulement de tickets envoyes.`,
+    });
+  }
+
+  const currentRecurringIndex = buildAuditRecurringIndex(currentTickets);
+  const referenceRecurringIndex = buildAuditRecurringIndex(referenceTickets);
+
+  const recurringCandidates = [...currentRecurringIndex.entries()]
+    .map(([key, currentValue]) => {
+      const referenceValue = referenceRecurringIndex.get(key);
+
+      if (!referenceValue) {
+        return null;
+      }
+
+      const currentAverage = currentValue.totalAmount / currentValue.count;
+      const referenceAverage = referenceValue.totalAmount / referenceValue.count;
+      const tolerance = Math.max(3, referenceAverage * 0.18);
+
+      if (!isCloseAmount(currentAverage, referenceAverage, tolerance)) {
+        return null;
+      }
+
+      const trackedSubscription =
+        subscriptions.find((subscription) => {
+          const normalizedSubscription = normalizeAuditDescription(subscription.label);
+
+          if (!normalizedSubscription) {
+            return false;
+          }
+
+          return (
+            (key.includes(normalizedSubscription) || normalizedSubscription.includes(key)) &&
+            isCloseAmount(currentAverage, subscription.amount, Math.max(2.5, subscription.amount * 0.18))
+          );
+        }) ?? null;
+
+      return {
+        key,
+        label: currentValue.label,
+        category: currentValue.category || referenceValue.category || "Sans categorie",
+        currentAmount: currentAverage,
+        referenceAmount: referenceAverage,
+        delta: currentAverage - referenceAverage,
+        currentCount: currentValue.count,
+        referenceCount: referenceValue.count,
+        tracked: Boolean(trackedSubscription),
+        trackedLabel: trackedSubscription?.label ?? "",
+      } satisfies AuditRecurringCandidate;
+    })
+    .filter((item): item is AuditRecurringCandidate => item !== null)
+    .sort((left, right) => {
+      if (left.tracked !== right.tracked) {
+        return Number(left.tracked) - Number(right.tracked);
+      }
+
+      return right.currentAmount - left.currentAmount;
+    });
+
+  const untrackedRecurring = recurringCandidates.filter((item) => !item.tracked);
+
+  if (untrackedRecurring.length > 0) {
+    const firstRecurring = untrackedRecurring[0];
+
+    alerts.push({
+      id: "recurring",
+      severity: untrackedRecurring.length > 2 ? "warning" : "ok",
+      icon: "LOOP",
+      title:
+        untrackedRecurring.length > 1
+          ? `${untrackedRecurring.length} depenses recurrentes a cadrer`
+          : "Depense recurrente a suivre",
+      detail: `${firstRecurring.label} revient aussi sur la periode de reference sans etre rattache a un abonnement suivi.`,
+      amount: firstRecurring.currentAmount,
+    });
+  }
+
+  const dedupedFlaggedTickets = dedupeAuditFlaggedTickets(flaggedTickets);
+  const underWatchTotal = dedupedFlaggedTickets.reduce(
+    (sum, item) => sum + item.ticket.amount,
+    0
+  );
+
+  alerts.sort((left, right) => {
+    const severityDelta =
+      getAuditSeverityRank(right.severity) - getAuditSeverityRank(left.severity);
+
+    if (severityDelta !== 0) {
+      return severityDelta;
+    }
+
+    return (right.amount ?? 0) - (left.amount ?? 0);
+  });
+
+  const criticalCount = alerts.filter((alert) => alert.severity === "critical").length;
+  const warningCount = alerts.filter((alert) => alert.severity === "warning").length;
+  const okCount = alerts.filter((alert) => alert.severity === "ok").length;
+  const duplicateGroupCount = duplicateGroups.length;
+  const outlierCount = outliers.length;
+  const untrackedRecurringCount = untrackedRecurring.length;
+
+  let score = 100;
+  score -= criticalCount * 18;
+  score -= warningCount * 9;
+  score -= Math.min(22, Math.max(0, currentMetrics.unexpectedSpend) / 12);
+  score -= Math.min(12, currentMetrics.pendingCount * 1.5);
+  score -= Math.min(10, duplicateGroupCount * 4);
+  score -= Math.min(10, untrackedRecurringCount * 3);
+  score += Math.min(6, okCount * 2);
+  score = clampNumber(Math.round(score), 18, 100);
+
+  const statusTone: AuditSeverity =
+    score >= 82 ? "ok" : score >= 60 ? "warning" : "critical";
+  const statusLabel =
+    statusTone === "ok"
+      ? "Mois sain"
+      : statusTone === "warning"
+        ? "A surveiller"
+        : "Sous tension";
+
+  if (alerts.length === 0) {
+    alerts.push({
+      id: "clean",
+      severity: "ok",
+      icon: "OK",
+      title: "Aucune alerte majeure",
+      detail: "Le mois reste propre pour le moment, sans signal evident a escalader.",
+    });
+  }
+
+  return {
+    score,
+    statusLabel,
+    statusTone,
+    alerts,
+    flaggedTickets: dedupedFlaggedTickets,
+    recurringCandidates,
+    categoryDeltas,
+    underWatchTotal,
+    criticalCount,
+    warningCount,
+    okCount,
+    duplicateGroupCount,
+    outlierCount,
+    untrackedRecurringCount,
+  };
 }
 
 function renderMonthFilter(selectedMonth: string, onMonthChange: (month: string) => void) {
@@ -1738,155 +2786,317 @@ function renderTicketModal(
   voiceStep: VoiceStep,
   voiceFeedback: string,
   selectedMonth: string,
+  categoryPromptOpen: boolean,
+  followUpPrompt: TicketFollowUpPrompt | null,
   onClose: () => void,
   onSubmit: () => void,
+  onAnotherTicketChoice: (wantsAnotherTicket: boolean) => void,
   onChange: (patch: Partial<NewTicketForm>) => void,
   onToggleVoice: () => void
 ) {
-  const voiceStepValues = [
-    { key: "date" as VoiceStep, label: "Date", value: form.date || "En attente" },
-    { key: "amount" as VoiceStep, label: "Montant", value: form.amount || "En attente" },
-    { key: "description" as VoiceStep, label: "Description", value: form.description || "En attente" },
-    { key: "confirm" as VoiceStep, label: "Categorie", value: form.category || "A confirmer" },
-  ];
+  const detectedCategory = inferCategoryFromDescription(form.description);
+  const hasAutoCategory = Boolean(detectedCategory);
+  const formComplete = Boolean(form.date && form.amount && form.description.trim());
+  const isFollowUpMode = Boolean(followUpPrompt);
+
+  const handleDescriptionChange = (value: string) => {
+    const detected = inferCategoryFromDescription(value);
+    if (detected) {
+      onChange({ description: value, category: detected });
+    } else {
+      onChange({ description: value });
+    }
+  };
 
   return (
-    <div className="modal-backdrop">
-      <div className="ticket-modal">
-        <div className="ticket-modal-head">
-          <div>
-            <span className="eyebrow">Nouveau ticket</span>
-            <h2>Ajouter une depense sur {getSelectedMonthLabel(selectedMonth).toLowerCase()}</h2>
+    <div className="modal-backdrop" onClick={(e) => { if (e.target === e.currentTarget && !submitting) onClose(); }}>
+      <div className="ntm-shell">
+
+        <div className="ntm-header">
+          <div className="ntm-header-left">
+            <span className="ntm-badge">{isFollowUpMode ? "Ticket enregistre" : "Nouveau ticket"}</span>
+            <h2 className="ntm-title">
+              {isFollowUpMode ? "Ajouter un autre ticket ?" : "Ajouter une depense"}
+              <span className="ntm-title-month">
+                {getSelectedMonthLabel(selectedMonth)}
+              </span>
+            </h2>
           </div>
-          <button type="button" className="modal-close" onClick={onClose}>
-            Fermer
+          <button type="button" className="ntm-close" onClick={onClose} disabled={submitting}>
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M12 4L4 12M4 4l8 8" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/></svg>
           </button>
         </div>
 
-        <div className="voice-panel">
-          <div className="voice-panel-head">
-            <div>
-              <span className="eyebrow">Assistant vocal</span>
-              <strong>Checklist guidee premium: je te demande, tu reponds, ca remplit tout seul.</strong>
-            </div>
-            <button
-              type="button"
-              className={`voice-btn ${voiceListening ? "active" : ""}`}
-              onClick={onToggleVoice}
-              disabled={!voiceSupported}
-            >
-              {voiceListening ? "Arreter l ecoute" : "Lancer la dictee"}
-            </button>
-          </div>
-
-          <div className="voice-step-card">
-            <span>Etape en cours</span>
-            <strong>{getVoiceStepLabel(voiceStep)}</strong>
-            <p>{getVoiceStepPrompt(voiceStep, form)}</p>
-          </div>
-
-          <div className="voice-progress">
-            {voiceStepValues.map((item, index) => (
-              <div
-                className={`voice-progress-chip ${getVoiceStepState(item.key, voiceStep, form)}`}
-                key={item.label}
-              >
-                <span>{index + 1}</span>
-                <strong>{item.label}</strong>
+        <div className="ntm-body">
+          {isFollowUpMode ? (
+            <div className="ntm-followup">
+              <div className="ntm-followup-card">
+                <span className="ntm-followup-kicker">Confirmation</span>
+                <strong>Ticket ajoute avec succes.</strong>
+                <p>
+                  Veux-tu ajouter un autre ticket ?
+                  {followUpPrompt?.keepDate ? ` La date ${followUpPrompt.keepDate} sera conservee.` : ""}
+                </p>
               </div>
-            ))}
-          </div>
 
-          <div className={`voice-transcript ${voiceTranscript ? "live" : ""}`}>
-            {voiceTranscript || "Parle librement, la reponse reconnue s affiche ici en direct."}
-          </div>
+              <div className="ntm-voice-section">
+                <div className="ntm-voice-head">
+                  <div className="ntm-voice-head-left">
+                    <span className="ntm-voice-icon">{voiceListening ? "●" : "🎤"}</span>
+                    <div>
+                      <strong className="ntm-voice-title">Assistant vocal</strong>
+                      <span className="ntm-voice-sub">Reponds oui ou non pour continuer</span>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    className={`ntm-voice-btn ${voiceListening ? "listening" : ""}`}
+                    onClick={onToggleVoice}
+                    disabled={!voiceSupported}
+                  >
+                    {voiceListening ? "Arreter" : "Dicter"}
+                  </button>
+                </div>
 
-          {voiceFeedback ? <div className="voice-feedback">{voiceFeedback}</div> : null}
+                {(voiceListening || voiceTranscript) && (
+                  <div className="ntm-voice-live">
+                    <div className="ntm-voice-prompt">
+                      <span className="ntm-voice-prompt-label">Question</span>
+                      <p className="ntm-voice-prompt-text">{getAnotherTicketVoicePrompt()}</p>
+                    </div>
 
-          <div className="voice-checklist">
-            {voiceStepValues.map((item) => (
-              <div
-                className={`voice-check-item ${getVoiceStepState(item.key, voiceStep, form)}`}
-                key={item.label}
-              >
-                <span>{item.label}</span>
-                <strong>{item.value}</strong>
+                    <div className={`ntm-voice-transcript ${voiceTranscript ? "has-text" : ""}`}>
+                      <span className="ntm-voice-wave">
+                        <span /><span /><span /><span /><span />
+                      </span>
+                      <span>{voiceTranscript || "En attente de votre voix..."}</span>
+                    </div>
+                  </div>
+                )}
+
+                {voiceFeedback && (
+                  <div className="ntm-voice-feedback">{voiceFeedback}</div>
+                )}
+
+                {!voiceSupported && (
+                  <div className="ntm-voice-unavailable">
+                    La dictee vocale n est pas disponible sur ce navigateur.
+                  </div>
+                )}
               </div>
-            ))}
-          </div>
-
-          <div className="voice-hints">
-            {voiceHints.map((hint) => (
-              <span key={hint}>{hint}</span>
-            ))}
-          </div>
-
-          {!voiceSupported ? (
-            <div className="status warn">
-              La dictee vocale n est pas disponible sur ce navigateur/runtime.
             </div>
-          ) : null}
+          ) : (
+            <>
+              <div className="ntm-form-section">
+
+                <div className="ntm-row-2">
+                  <label className="ntm-field">
+                    <span className="ntm-label">Date</span>
+                    <div className="ntm-input-wrap">
+                      <input
+                        className="ntm-input"
+                        type="date"
+                        value={form.date}
+                        onChange={(e) => onChange({ date: e.target.value })}
+                      />
+                    </div>
+                  </label>
+
+                  <label className="ntm-field">
+                    <span className="ntm-label">Montant</span>
+                    <div className="ntm-input-wrap ntm-input-wrap-euro">
+                      <input
+                        className="ntm-input"
+                        type="text"
+                        inputMode="decimal"
+                        placeholder="0,00"
+                        value={form.amount}
+                        onChange={(e) => onChange({ amount: e.target.value })}
+                      />
+                      <span className="ntm-input-suffix">€</span>
+                    </div>
+                  </label>
+                </div>
+
+                <label className="ntm-field">
+                  <span className="ntm-label">Description</span>
+                  <div className="ntm-input-wrap ntm-input-wrap-description">
+                    <input
+                      className="ntm-input"
+                      type="text"
+                      placeholder="Ex: Carrefour, Netflix, Garage..."
+                      value={form.description}
+                      onChange={(e) => handleDescriptionChange(e.target.value)}
+                      autoFocus
+                    />
+                    {hasAutoCategory && (
+                      <span className="ntm-auto-badge" title="Categorie detectee automatiquement">
+                        {detectedCategory}
+                      </span>
+                    )}
+                  </div>
+                  {hasAutoCategory && (
+                    <span className="ntm-auto-hint">Categorie detectee automatiquement d apres la description</span>
+                  )}
+                </label>
+
+                <label className="ntm-field">
+                  <span className="ntm-label">Categorie</span>
+                  <select
+                    className="ntm-input ntm-select"
+                    value={form.category}
+                    onChange={(e) => onChange({ category: e.target.value })}
+                  >
+                    <option value="">Sans categorie</option>
+                    {SHEET_ALL_CATEGORIES.map((cat) => (
+                      <option key={cat} value={cat}>{cat}</option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+
+              {categoryPromptOpen && !form.category && (
+                <div className="ntm-category-popup">
+                  <div className="ntm-category-popup-head">
+                    <strong>Categorie non detectee</strong>
+                    <span>Choisis-la pour terminer le ticket.</span>
+                  </div>
+                  <select
+                    className="ntm-input ntm-select ntm-category-popup-select"
+                    value={form.category}
+                    onChange={(e) => onChange({ category: e.target.value })}
+                  >
+                    <option value="">-- Choisir une categorie --</option>
+                    {SHEET_ALL_CATEGORIES.map((cat) => (
+                      <option key={`popup-${cat}`} value={cat}>{cat}</option>
+                    ))}
+                  </select>
+                </div>
+              )}
+
+              <div className="ntm-voice-section">
+                <div className="ntm-voice-head">
+                  <div className="ntm-voice-head-left">
+                    <span className="ntm-voice-icon">{voiceListening ? "●" : "🎤"}</span>
+                    <div>
+                      <strong className="ntm-voice-title">Assistant vocal</strong>
+                      <span className="ntm-voice-sub">Dictee intelligente guidee</span>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    className={`ntm-voice-btn ${voiceListening ? "listening" : ""}`}
+                    onClick={onToggleVoice}
+                    disabled={!voiceSupported}
+                  >
+                    {voiceListening ? "Arreter" : "Dicter"}
+                  </button>
+                </div>
+
+                {voiceListening && (
+                  <div className="ntm-voice-live">
+                    <div className="ntm-voice-step-row">
+                      {(["date", "amount", "description", "confirm"] as VoiceStep[]).map((step, i) => {
+                        const state = getVoiceStepState(step, voiceStep, form);
+                        return (
+                          <div className={`ntm-voice-step ${state}`} key={step}>
+                            <span className="ntm-voice-step-num">{i + 1}</span>
+                            <span className="ntm-voice-step-label">{getVoiceStepLabel(step)}</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    <div className="ntm-voice-prompt">
+                      <span className="ntm-voice-prompt-label">Etape: {getVoiceStepLabel(voiceStep)}</span>
+                      <p className="ntm-voice-prompt-text">{getVoiceStepPrompt(voiceStep, form)}</p>
+                    </div>
+
+                    <div className={`ntm-voice-transcript ${voiceTranscript ? "has-text" : ""}`}>
+                      <span className="ntm-voice-wave">
+                        <span /><span /><span /><span /><span />
+                      </span>
+                      <span>{voiceTranscript || "En attente de votre voix..."}</span>
+                    </div>
+                  </div>
+                )}
+
+                {voiceFeedback && (
+                  <div className="ntm-voice-feedback">{voiceFeedback}</div>
+                )}
+
+                {!voiceSupported && (
+                  <div className="ntm-voice-unavailable">
+                    La dictee vocale n est pas disponible sur ce navigateur.
+                  </div>
+                )}
+              </div>
+
+              {formComplete && (
+                <div className="ntm-recap">
+                  <span className="ntm-recap-label">Recap du ticket</span>
+                  <div className="ntm-recap-grid">
+                    <div className="ntm-recap-item">
+                      <span>Date</span>
+                      <strong>{form.date}</strong>
+                    </div>
+                    <div className="ntm-recap-item">
+                      <span>Montant</span>
+                      <strong>{form.amount} €</strong>
+                    </div>
+                    <div className="ntm-recap-item ntm-recap-wide">
+                      <span>Description</span>
+                      <strong>{form.description}</strong>
+                    </div>
+                    <div className="ntm-recap-item ntm-recap-wide">
+                      <span>Categorie</span>
+                      <strong>{form.category || "Aucune"}</strong>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
         </div>
 
-        <div className="ticket-form-grid">
-          <label className={`field-block ${voiceStep === "date" ? "active" : ""}`}>
-            <span>Date</span>
-            <input
-              className="field-input"
-              type="date"
-              value={form.date}
-              onChange={(event) => onChange({ date: event.target.value })}
-            />
-          </label>
+        {submitError && <div className="ntm-error">{submitError}</div>}
 
-          <label className={`field-block ${voiceStep === "amount" ? "active" : ""}`}>
-            <span>Montant</span>
-            <input
-              className="field-input"
-              type="text"
-              inputMode="decimal"
-              placeholder="12,34"
-              value={form.amount}
-              onChange={(event) => onChange({ amount: event.target.value })}
-            />
-          </label>
-
-          <label className={`field-block field-block-wide ${voiceStep === "description" ? "active" : ""}`}>
-            <span>Description</span>
-            <input
-              className="field-input"
-              type="text"
-              placeholder="Ex: Carrefour"
-              value={form.description}
-              onChange={(event) => onChange({ description: event.target.value })}
-            />
-          </label>
-
-          <label className={`field-block field-block-wide ${voiceStep === "confirm" ? "active" : ""}`}>
-            <span>Categorie</span>
-            <select
-              className="field-input"
-              value={form.category}
-              onChange={(event) => onChange({ category: event.target.value })}
-            >
-              {categoryOptions.map((category) => (
-                <option key={category} value={category}>
-                  {category}
-                </option>
-              ))}
-            </select>
-          </label>
-        </div>
-
-        {submitError ? <div className="status warn">{submitError}</div> : null}
-
-        <div className="ticket-modal-actions">
-          <button type="button" className="ghost-btn" onClick={onClose}>
-            Annuler
-          </button>
-          <button type="button" className="primary-btn" onClick={onSubmit} disabled={submitting}>
-            {submitting ? "Envoi..." : "Enregistrer le ticket"}
-          </button>
+        <div className="ntm-footer">
+          {isFollowUpMode ? (
+            <>
+              <button type="button" className="ntm-cancel" onClick={() => onAnotherTicketChoice(false)}>
+                Non
+              </button>
+              <button
+                type="button"
+                className="ntm-submit ready"
+                onClick={() => onAnotherTicketChoice(true)}
+              >
+                Oui, un autre ticket
+              </button>
+            </>
+          ) : (
+            <>
+              <button type="button" className="ntm-cancel" onClick={onClose} disabled={submitting}>
+                Annuler
+              </button>
+              <button
+                type="button"
+                className={`ntm-submit ${formComplete ? "ready" : ""}`}
+                onClick={onSubmit}
+                disabled={submitting || !formComplete}
+              >
+                {submitting ? (
+                  <span className="ntm-submit-loading">
+                    <span className="ntm-spinner" />
+                    Envoi en cours...
+                  </span>
+                ) : (
+                  "Enregistrer le ticket"
+                )}
+              </button>
+            </>
+          )}
         </div>
       </div>
     </div>
@@ -1895,11 +3105,12 @@ function renderTicketModal(
 
 function renderDashboard(
   tickets: Ticket[],
+  monthSummary: TicketMonthSummary | null,
   loading: boolean,
   refreshing: boolean,
   error: string,
   selectedMonth: string,
-  lastSyncLabel: string,
+  lastSyncAt: number | null,
   reimbursementTotal: number,
   subscriptions: DashboardSubscription[],
   subPanelOpen: boolean,
@@ -1915,7 +3126,10 @@ function renderDashboard(
   onSubFormAmountChange: (v: string) => void,
   onAddSubscription: () => void,
   onDeleteSubscription: (id: string) => void,
-  subDeletePanelOpen: boolean
+  subDeletePanelOpen: boolean,
+  unexpectedSpendModalOpen: boolean,
+  onOpenUnexpectedSpendModal: () => void,
+  onCloseUnexpectedSpendModal: () => void
 ) {
   const monthlyTotal = tickets.reduce((sum, ticket) => sum + ticket.amount, 0);
   const sentCount = tickets.filter((ticket) => ticket.sent).length;
@@ -1926,10 +3140,26 @@ function renderDashboard(
   const monthlyIncome = ticketsFinancePreset.monthlyIncome;
   const budgetLines = computeTicketBudgetLines(tickets);
   const budgetPlannedTotal = budgetLines.reduce((sum, line) => sum + line.planned, 0);
-  const currentRemaining = monthlyIncome - monthlyTotal;
-  const theoreticalRemaining = monthlyIncome - budgetPlannedTotal;
-  const unexpectedSpend = currentRemaining - theoreticalRemaining;
-  const unexpectedSpendTone = getBudgetDifferenceTone(unexpectedSpend);
+  const currentBalance = monthlyIncome - monthlyTotal;
+  const accountBalanceValue = monthSummary?.accountBalance ?? null;
+  const currentRemainingValue = monthSummary?.currentRemaining ?? currentBalance;
+  const theoreticalRemainingValue =
+    monthSummary?.theoreticalRemaining ?? monthlyIncome - budgetPlannedTotal;
+  const unexpectedSpendTotalValue =
+    monthSummary?.unexpectedSpendTotal ??
+    (currentRemainingValue !== null && theoreticalRemainingValue !== null
+      ? currentRemainingValue - theoreticalRemainingValue
+      : null);
+  const unexpectedSpendTone =
+    unexpectedSpendTotalValue !== null
+      ? getBudgetDifferenceTone(unexpectedSpendTotalValue)
+      : "neutral";
+  const unexpectedSpendTickets = buildUnexpectedSpendTickets(tickets);
+  const unexpectedSpendCategoryTotals = buildUnexpectedSpendCategoryTotals(tickets);
+  const unexpectedSpendCategoryTotalValue = unexpectedSpendCategoryTotals.reduce(
+    (sum, item) => sum + item.total,
+    0
+  );
   const sentRatio = tickets.length > 0 ? Math.round((sentCount / tickets.length) * 100) : 0;
   const totalWithReimbursements = monthlyTotal + reimbursementTotal;
 
@@ -1937,8 +3167,14 @@ function renderDashboard(
     ? "Chargement des donnees..."
     : error
       ? "Connexion Google Sheets a verifier"
-      : lastSyncLabel
-        ? `Google Sheets OK • sync ${lastSyncLabel}`
+      : refreshing
+        ? "Google Sheets OK • actualisation..."
+      : lastSyncAt
+        ? (
+            <>
+              Google Sheets OK • <LiveRelativeSyncLabel syncedAt={lastSyncAt} />
+            </>
+          )
         : "Google Sheets OK • donnees chargees";
 
   const archiveToneClass = pendingCount === 0 || sentRatio >= 70 ? "ok" : "warn";
@@ -1961,8 +3197,7 @@ function renderDashboard(
             </div>
           </div>
 
-          <div className="dashboard-v3-right">
-            {(() => {
+          {(() => {
               const coursesLine = budgetLines.find((l) => l.key === "courses");
               const essenceLine = budgetLines.find((l) => l.key === "essence");
               const coursesBudget = 600;
@@ -1974,64 +3209,58 @@ function renderDashboard(
               const coursesRemain = Math.max(0, coursesBudget - coursesSpent);
               const essenceRemain = Math.max(0, essenceBudget - essenceSpent);
               return (
-                <>
-                  <div className="dashboard-v3-row">
-                    <div className="dashboard-budget-gauge-card">
-                      <div className="budget-gauge-item">
-                        <div className="budget-gauge-header">
-                          <span className="budget-gauge-label">🛒 Courses</span>
-                          <span className="budget-gauge-values">{euro.format(coursesSpent)} / {euro.format(coursesBudget)}</span>
-                        </div>
-                        <div className="budget-gauge-track">
-                          <div
-                            className={`budget-gauge-fill ${coursesPct >= 90 ? "danger" : coursesPct >= 70 ? "warn" : "ok"}`}
-                            style={{ width: `${coursesPct}%` }}
-                          />
-                        </div>
-                        <span className="budget-gauge-remain">Reste {euro.format(coursesRemain)}</span>
+                <div className="dashboard-v3-center">
+                  <div className="dashboard-budget-gauge-card">
+                    <div className="budget-gauge-item">
+                      <div className="budget-gauge-header">
+                        <span className="budget-gauge-label">🛒 Courses</span>
+                        <span className="budget-gauge-values">{euro.format(coursesSpent)} / {euro.format(coursesBudget)}</span>
                       </div>
-                    </div>
-                    <div className="dashboard-v3-period-card">
-                      {renderMonthFilter(selectedMonth, onMonthChange)}
+                      <div className="budget-gauge-track">
+                        <div
+                          className={`budget-gauge-fill ${coursesPct >= 90 ? "danger" : coursesPct >= 70 ? "warn" : "ok"}`}
+                          style={{ width: `${coursesPct}%` }}
+                        />
+                      </div>
+                      <span className="budget-gauge-remain">Reste {euro.format(coursesRemain)}</span>
                     </div>
                   </div>
-
-                  <div className="dashboard-v3-row">
-                    <div className="dashboard-budget-gauge-card">
-                      <div className="budget-gauge-item">
-                        <div className="budget-gauge-header">
-                          <span className="budget-gauge-label">⛽ Essence</span>
-                          <span className="budget-gauge-values">{euro.format(essenceSpent)} / {euro.format(essenceBudget)}</span>
-                        </div>
-                        <div className="budget-gauge-track">
-                          <div
-                            className={`budget-gauge-fill ${essencePct >= 90 ? "danger" : essencePct >= 70 ? "warn" : "ok"}`}
-                            style={{ width: `${essencePct}%` }}
-                          />
-                        </div>
-                        <span className="budget-gauge-remain">Reste {euro.format(essenceRemain)}</span>
+                  <div className="dashboard-budget-gauge-card">
+                    <div className="budget-gauge-item">
+                      <div className="budget-gauge-header">
+                        <span className="budget-gauge-label">⛽ Essence</span>
+                        <span className="budget-gauge-values">{euro.format(essenceSpent)} / {euro.format(essenceBudget)}</span>
                       </div>
-                    </div>
-                    <div className="dashboard-v3-total-card">
-                      <div className="dashboard-v3-total-main">
-                        <span className="dashboard-v3-total-label">
-                          Total depenses + remboursement
-                        </span>
-                        <strong>{euro.format(totalWithReimbursements)}</strong>
+                      <div className="budget-gauge-track">
+                        <div
+                          className={`budget-gauge-fill ${essencePct >= 90 ? "danger" : essencePct >= 70 ? "warn" : "ok"}`}
+                          style={{ width: `${essencePct}%` }}
+                        />
                       </div>
-
-                      <div className="dashboard-v3-total-meta">
-                        <span>{euro.format(monthlyTotal)} depenses</span>
-                        <span>{euro.format(reimbursementTotal)} remboursements</span>
-                      </div>
+                      <span className="budget-gauge-remain">Reste {euro.format(essenceRemain)}</span>
                     </div>
                   </div>
-                </>
+                </div>
               );
             })()}
 
+          <div className="dashboard-v3-right">
+            <div className="dashboard-v3-period-card">
+              {renderMonthFilter(selectedMonth, onMonthChange)}
+            </div>
+            <div className="dashboard-v3-total-card">
+              <div className="dashboard-v3-total-main">
+                <span className="dashboard-v3-total-label">
+                  Total depenses + remboursement
+                </span>
+                <strong>{euro.format(totalWithReimbursements)}</strong>
+              </div>
+              <div className="dashboard-v3-total-meta">
+                <span>{euro.format(monthlyTotal)} depenses</span>
+                <span>{euro.format(reimbursementTotal)} remboursements</span>
+              </div>
+            </div>
             <span className="dashboard-v3-status-line">
-              {refreshing ? <span className="sync-badge">Synchro...</span> : null}
               Etat connexion : {dashboardStatus}
             </span>
           </div>
@@ -2041,29 +3270,33 @@ function renderDashboard(
       <section className="stats-grid dashboard-v3-kpi-grid">
         <article className="card accent-blue dashboard-v3-kpi-card">
           <span className="card-label">Solde du compte</span>
-          <strong className="card-value">{euro.format(currentRemaining)}</strong>
-          <span className="card-sub">Revenu - depenses du mois</span>
+          <strong className="card-value">
+            {accountBalanceValue !== null ? euro.format(accountBalanceValue) : "--"}
+          </strong>
         </article>
 
         <article className="card accent-mint dashboard-v3-kpi-card">
           <span className="card-label">Reste en cours</span>
-          <strong className="card-value">{euro.format(currentRemaining)}</strong>
-          <span className="card-sub">Disponible estime actuellement</span>
+          <strong className="card-value">{euro.format(currentRemainingValue)}</strong>
         </article>
 
         <article className="card accent-rose dashboard-v3-kpi-card">
           <span className="card-label">Reste theorique</span>
-          <strong className="card-value">{euro.format(theoreticalRemaining)}</strong>
-          <span className="card-sub">Selon ton budget cible</span>
+          <strong className="card-value">{euro.format(theoreticalRemainingValue)}</strong>
         </article>
 
-        <article className="card accent-salmon dashboard-v3-kpi-card">
+        <button
+          type="button"
+          className="card accent-salmon dashboard-v3-kpi-card dashboard-v3-kpi-card-button"
+          onClick={onOpenUnexpectedSpendModal}
+        >
           <span className="card-label">Depense non prevue</span>
           <strong className={`card-value tickets-diff-text ${unexpectedSpendTone}`}>
-            {formatBudgetDifference(unexpectedSpend)}
+            {unexpectedSpendTotalValue !== null
+              ? formatBudgetDifference(unexpectedSpendTotalValue)
+              : "--"}
           </strong>
-          <span className="card-sub">Ecart reel vs theorique</span>
-        </article>
+        </button>
       </section>
 
       <section className="dashboard-v3-bottom-grid">
@@ -2300,12 +3533,107 @@ function renderDashboard(
           </div>
         </div>
       )}
+
+      {unexpectedSpendModalOpen && (
+        <div className="modal-backdrop" onClick={onCloseUnexpectedSpendModal}>
+          <div
+            className="dashboard-v3-unexpected-modal"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="dashboard-v3-unexpected-head">
+              <div>
+                <span className="panel-kicker">Depenses non prevues</span>
+                <h2>{getSelectedMonthLabel(selectedMonth)}</h2>
+                <p>
+                  Basee uniquement sur les categories non prevues du sheet
+                  en C25:C36 et C38, avec les tickets associes.
+                </p>
+              </div>
+
+              <button type="button" className="modal-close" onClick={onCloseUnexpectedSpendModal}>
+                Fermer
+              </button>
+            </div>
+
+            <div className="dashboard-v3-unexpected-summary">
+              <div className="dashboard-v3-unexpected-tile">
+                <span>Total delta</span>
+                <strong className={unexpectedSpendTone}>
+                  {unexpectedSpendTotalValue !== null
+                    ? formatBudgetDifference(unexpectedSpendTotalValue)
+                    : "--"}
+                </strong>
+              </div>
+
+              <div className="dashboard-v3-unexpected-tile">
+                <span>Total categories non prevues</span>
+                <strong>{euro.format(unexpectedSpendCategoryTotalValue)}</strong>
+              </div>
+
+              <div className="dashboard-v3-unexpected-tile">
+                <span>Tickets reperes</span>
+                <strong>{unexpectedSpendTickets.length}</strong>
+              </div>
+            </div>
+
+            <div className="dashboard-v3-unexpected-body">
+              {unexpectedSpendCategoryTotals.length > 0 ? (
+                <div className="dashboard-v3-unexpected-category-list">
+                  {unexpectedSpendCategoryTotals.map((item) => (
+                    <div
+                      className="dashboard-v3-unexpected-category-chip"
+                      key={`unexpected-category-${item.category}`}
+                    >
+                      <span>{item.category}</span>
+                      <strong>{euro.format(item.total)}</strong>
+                      <small>{item.count} ticket(s)</small>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+
+              {unexpectedSpendTickets.length > 0 ? (
+                <div className="dashboard-v3-unexpected-list">
+                  {unexpectedSpendTickets.map(({ ticket, reason }, index) => (
+                    <div
+                      className="dashboard-v3-unexpected-row"
+                      key={`unexpected-${getTicketKey(ticket)}-${index}`}
+                    >
+                      <div className="dashboard-v3-unexpected-row-main">
+                        <strong>{ticket.description || "Sans description"}</strong>
+                        <span>{ticket.category || "Sans categorie"} • {ticket.date || "Sans date"}</span>
+                        <p>{reason}</p>
+                      </div>
+
+                      <div className="dashboard-v3-unexpected-row-side">
+                        <span className={`ticket-badge ${ticket.sent ? "sent" : "pending"}`}>
+                          {ticket.sent ? "Envoye" : "En attente"}
+                        </span>
+                        <strong>{euro.format(ticket.amount)}</strong>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="dashboard-v3-unexpected-empty">
+                  <strong>Aucune depense non prevue dans ces categories.</strong>
+                  <p>
+                    Aucune ligne ticket ne remonte actuellement sur les categories
+                    non prevues du sheet.
+                  </p>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 }
 
 function renderTickets(
-  tickets: Ticket[],
+  visibleTickets: Ticket[],
+  allTickets: Ticket[],
   monthSummary: TicketMonthSummary | null,
   totalTicketsCount: number,
   loading: boolean,
@@ -2321,9 +3649,9 @@ function renderTickets(
   reimbursementStatus: string,
   reimbursementError: string,
   selectedMonth: string,
-  lastSyncLabel: string,
+  lastSyncAt: number | null,
+  ticketsSheetModalOpen: boolean,
   searchQuery: string,
-  categoryChoices: string[],
   categoryFilter: string,
   statusFilter: TicketStatusFilter,
   sortMode: TicketSortMode,
@@ -2334,18 +3662,32 @@ function renderTickets(
   onStatusFilterChange: (value: TicketStatusFilter) => void,
   onSortModeChange: (value: TicketSortMode) => void,
   onOpenTicketModal: () => void,
+  onOpenTicketsSheetModal: () => void,
+  onCloseTicketsSheetModal: () => void,
   onCloseBudgetDetails: () => void,
   onReimbursementFormChange: (patch: Partial<ReimbursementFormLine>) => void,
   onSubmitReimbursements: () => void,
   onDeleteReimbursement: (row: number) => void,
   onTicketHover: (ticket: Ticket) => void,
-  onTicketLeave: () => void
+  onTicketLeave: () => void,
+  editingTicket: Ticket | null,
+  editTicketForm: { date: string; description: string; category: string; amount: string },
+  editTicketSaving: boolean,
+  editTicketError: string,
+  onStartEditTicket: (ticket: Ticket) => void,
+  onCancelEditTicket: () => void,
+  onEditTicketFormChange: (patch: Partial<{ date: string; description: string; category: string; amount: string }>) => void,
+  onSaveEditTicket: () => void
 ) {
-  const monthlyTotal = tickets.reduce((sum, ticket) => sum + ticket.amount, 0);
+  const monthlyTotal = allTickets.reduce((sum, ticket) => sum + ticket.amount, 0);
   const isBusy = loading || refreshing;
   const selectedMonthLabel = getSelectedMonthLabel(selectedMonth);
+  const sheetTickets = filterAndSortTickets(allTickets, "", "all", "all", sortMode);
+  const sheetSentCount = sheetTickets.filter((ticket) => ticket.sent).length;
+  const sheetPendingCount = sheetTickets.length - sheetSentCount;
+  const sheetTotal = sheetTickets.reduce((sum, ticket) => sum + ticket.amount, 0);
 
-  const budgetLines = computeTicketBudgetLines(tickets);
+  const budgetLines = computeTicketBudgetLines(allTickets);
   const budgetPlannedTotal = budgetLines.reduce((sum, line) => sum + line.planned, 0);
   const budgetActualTotal = budgetLines.reduce((sum, line) => sum + line.actual, 0);
   const budgetDifferenceTotal = budgetActualTotal - budgetPlannedTotal;
@@ -2466,10 +3808,20 @@ function renderTickets(
               <span className="panel-kicker">Registre</span>
               <div className="panel-title-row">
                 <h2>Liste des tickets</h2>
-                {refreshing ? <span className="sync-badge">Synchro...</span> : null}
               </div>
             </div>
-            <button className="panel-link">Exporter</button>
+            <div className="panel-head-actions">
+              <button
+                type="button"
+                className="panel-link"
+                onClick={onOpenTicketsSheetModal}
+              >
+                Vue feuille
+              </button>
+              <button type="button" className="panel-link">
+                Exporter
+              </button>
+            </div>
           </div>
 
           <div className="panel-body table-body">
@@ -2481,14 +3833,14 @@ function renderTickets(
                 </div>
 
                 <div className="ticket-toolbar-meta">
-                  <span>{tickets.length} ticket(s) affiches sur {totalTicketsCount}</span>
+                  <span>{visibleTickets.length} ticket(s) affiches sur {totalTicketsCount}</span>
                   <span>
                     {searchQuery.trim() || categoryFilter !== "all" || statusFilter !== "all"
                       ? "Filtres actifs"
-                      : refreshing
+                      : isBusy
                         ? "Synchro en cours..."
-                        : lastSyncLabel
-                          ? `Synchro ${lastSyncLabel}`
+                        : lastSyncAt
+                          ? <LiveRelativeSyncLabel syncedAt={lastSyncAt} />
                           : "Vue complete"}
                   </span>
                 </div>
@@ -2516,7 +3868,7 @@ function renderTickets(
                     onChange={(event) => onCategoryFilterChange(event.target.value)}
                   >
                     <option value="all">Toutes les categories</option>
-                    {categoryChoices.map((category) => (
+                    {SHEET_ALL_CATEGORIES.map((category) => (
                       <option key={category} value={category}>
                         {category}
                       </option>
@@ -2564,9 +3916,81 @@ function renderTickets(
 
             {!loading &&
               !error &&
-              tickets.map((ticket, index) => {
+              visibleTickets.map((ticket, index) => {
                 const ticketKey = getTicketKey(ticket);
                 const watchingPeers = collaborators.filter((peer) => peer.focusTicketKey === ticketKey);
+                const isEditing = editingTicket !== null && getTicketKey(editingTicket) === ticketKey;
+
+                if (isEditing) {
+                  return (
+                    <div
+                      className="ticket-row ticket-row-editing"
+                      key={`${ticket.date}-${ticket.description}-${index}`}
+                    >
+                      <div className="ticket-edit-form">
+                        <div className="ticket-edit-fields">
+                          <label className="ticket-edit-field">
+                            <span>Description</span>
+                            <input
+                              className="field-input"
+                              type="text"
+                              value={editTicketForm.description}
+                              onChange={(e) => onEditTicketFormChange({ description: e.target.value })}
+                              autoFocus
+                              onKeyDown={(e) => { if (e.key === "Escape") onCancelEditTicket(); }}
+                            />
+                          </label>
+                          <label className="ticket-edit-field">
+                            <span>Montant (€)</span>
+                            <input
+                              className="field-input"
+                              type="text"
+                              inputMode="decimal"
+                              value={editTicketForm.amount}
+                              onChange={(e) => onEditTicketFormChange({ amount: e.target.value })}
+                              onKeyDown={(e) => {
+                                if (e.key === "Escape") onCancelEditTicket();
+                                if (e.key === "Enter") onSaveEditTicket();
+                              }}
+                            />
+                          </label>
+                          <label className="ticket-edit-field">
+                            <span>Date</span>
+                            <input
+                              className="field-input"
+                              type="date"
+                              value={editTicketForm.date}
+                              onChange={(e) => onEditTicketFormChange({ date: e.target.value })}
+                              onKeyDown={(e) => { if (e.key === "Escape") onCancelEditTicket(); }}
+                            />
+                          </label>
+                          <label className="ticket-edit-field ticket-edit-field-category">
+                            <span>Categorie</span>
+                            <select
+                              className="field-input"
+                              value={editTicketForm.category}
+                              onChange={(e) => onEditTicketFormChange({ category: e.target.value })}
+                            >
+                              <option value="">Sans categorie</option>
+                              {SHEET_ALL_CATEGORIES.map((cat) => (
+                                <option key={cat} value={cat}>{cat}</option>
+                              ))}
+                            </select>
+                          </label>
+                        </div>
+                        {editTicketError && <div className="ticket-edit-error">{editTicketError}</div>}
+                        <div className="ticket-edit-actions">
+                          <button className="ghost-btn" onClick={onCancelEditTicket} disabled={editTicketSaving}>
+                            Annuler
+                          </button>
+                          <button className="primary-btn" onClick={onSaveEditTicket} disabled={editTicketSaving}>
+                            {editTicketSaving ? "Sauvegarde..." : "Sauvegarder"}
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                }
 
                 return (
                   <div
@@ -2574,10 +3998,24 @@ function renderTickets(
                     key={`${ticket.date}-${ticket.description}-${index}`}
                     onMouseEnter={() => onTicketHover(ticket)}
                     onMouseLeave={onTicketLeave}
+                    onDoubleClick={() => {
+                      if (Number.isFinite(ticket.sheetRow) && Number.isFinite(ticket.blockIndex)) {
+                        onStartEditTicket(ticket);
+                      }
+                    }}
                   >
                     <div className="ticket-main">
                       <div className="ticket-title-row">
                         <strong>{ticket.description || "Sans description"}</strong>
+                        {Number.isFinite(ticket.sheetRow) && (
+                          <button
+                            className="ticket-edit-btn"
+                            title="Modifier ce ticket"
+                            onClick={(e) => { e.stopPropagation(); onStartEditTicket(ticket); }}
+                          >
+                            ✏️
+                          </button>
+                        )}
                       </div>
 
                       <div className="ticket-meta-row">
@@ -2610,7 +4048,7 @@ function renderTickets(
                 );
               })}
 
-            {!loading && !error && tickets.length === 0 && (
+            {!loading && !error && visibleTickets.length === 0 && (
               <div className="status info">Aucun ticket trouve.</div>
             )}
           </div>
@@ -2821,6 +4259,1156 @@ function renderTickets(
         </div>
       ) : null}
 
+      {ticketsSheetModalOpen ? (
+        <div className="modal-backdrop" onClick={onCloseTicketsSheetModal}>
+          <div
+            className="tickets-sheet-modal"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="tickets-sheet-modal-head">
+              <div>
+                <span className="panel-kicker">Vue feuille integrale</span>
+                <h2>Tous les tickets de {selectedMonthLabel.toLowerCase()}</h2>
+                <p>
+                  Une grande lecture type Google Sheets pour balayer toutes les
+                  lignes du mois sans ouvrir chaque ticket.
+                </p>
+              </div>
+
+              <div className="tickets-sheet-modal-head-actions">
+                <span className="tickets-sheet-sync-chip">
+                  <LiveRelativeSyncLabel
+                    syncedAt={lastSyncAt}
+                    loading={isBusy}
+                    waitingLabel="Donnees en attente"
+                  />
+                </span>
+                <button
+                  type="button"
+                  className="modal-close"
+                  onClick={onCloseTicketsSheetModal}
+                >
+                  Fermer
+                </button>
+              </div>
+            </div>
+
+            <div className="tickets-sheet-modal-summary">
+              <div className="tickets-sheet-modal-tile">
+                <span>Lignes</span>
+                <strong>{sheetTickets.length}</strong>
+              </div>
+              <div className="tickets-sheet-modal-tile">
+                <span>Total du mois</span>
+                <strong>{euro.format(sheetTotal)}</strong>
+              </div>
+              <div className="tickets-sheet-modal-tile">
+                <span>Envoyes</span>
+                <strong>{sheetSentCount}</strong>
+              </div>
+              <div className="tickets-sheet-modal-tile">
+                <span>En attente</span>
+                <strong>{sheetPendingCount}</strong>
+              </div>
+            </div>
+
+            <div className="tickets-sheet-table-shell">
+              {loading ? <div className="status info">Chargement des tickets...</div> : null}
+
+              {!loading && error ? renderGoogleSheetsError(error) : null}
+
+              {!loading && !error && sheetTickets.length > 0 ? (
+                <div className="tickets-sheet-table-wrap">
+                  <table className="tickets-sheet-table">
+                    <thead>
+                      <tr>
+                        <th>Ligne</th>
+                        <th>Date</th>
+                        <th>Description</th>
+                        <th>Categorie</th>
+                        <th>Statut</th>
+                        <th>Montant</th>
+                      </tr>
+                    </thead>
+
+                    <tbody>
+                      {sheetTickets.map((ticket, index) => (
+                        <tr key={`sheet-ticket-${getTicketKey(ticket)}-${index}`}>
+                          <td className="tickets-sheet-row-number">
+                            {Number.isFinite(ticket.sheetRow) ? ticket.sheetRow : index + 1}
+                          </td>
+                          <td>{ticket.date || "--"}</td>
+                          <td className="tickets-sheet-description-cell">
+                            <strong>{ticket.description || "Sans description"}</strong>
+                          </td>
+                          <td>{ticket.category || "Sans categorie"}</td>
+                          <td>
+                            <span className={`ticket-badge ${ticket.sent ? "sent" : "pending"}`}>
+                              {ticket.sent ? "Envoye" : "En attente"}
+                            </span>
+                          </td>
+                          <td className="tickets-sheet-amount-cell">
+                            {euro.format(ticket.amount)}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : null}
+
+              {!loading && !error && sheetTickets.length === 0 ? (
+                <div className="tickets-sheet-empty">
+                  Aucun ticket disponible pour ce mois.
+                </div>
+              ) : null}
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+    </>
+  );
+}
+
+function renderAudits(
+  tickets: Ticket[],
+  monthSummary: TicketMonthSummary | null,
+  selectedMonth: string,
+  referenceMonth: string,
+  referenceState: CompareMonthState,
+  loading: boolean,
+  refreshing: boolean,
+  error: string,
+  lastSyncAt: number | null,
+  subscriptions: DashboardSubscription[],
+  onMonthChange: (month: string) => void,
+  onReferenceMonthChange: (month: string) => void,
+  onRefresh: () => void
+) {
+  const selectedMonthLabel = getSelectedMonthLabel(selectedMonth);
+  const referenceMonthLabel = getSelectedMonthLabel(referenceMonth);
+  const sameReference = referenceMonth === selectedMonth;
+  const effectiveReferenceTickets = sameReference ? tickets : referenceState.tickets;
+  const effectiveReferenceSummary = sameReference ? monthSummary : referenceState.summary;
+  const referenceLoading = sameReference ? loading || refreshing : referenceState.loading;
+  const referenceError = sameReference ? error : referenceState.error;
+  const auditLoading = loading || refreshing || referenceLoading;
+  const report = buildAuditReport(
+    tickets,
+    monthSummary,
+    effectiveReferenceTickets,
+    subscriptions
+  );
+  const currentMetrics = buildCompareMonthMetrics(tickets, monthSummary);
+  const referenceMetrics = buildCompareMonthMetrics(
+    effectiveReferenceTickets,
+    effectiveReferenceSummary
+  );
+  const totalDelta = currentMetrics.total - referenceMetrics.total;
+  const totalDeltaTone = getBudgetDifferenceTone(totalDelta);
+  const referenceSyncLabel = sameReference
+    ? `Base identique a ${selectedMonthLabel}`
+    : referenceLoading
+        ? "Chargement..."
+        : referenceState.syncedAt
+          ? <LiveRelativeSyncLabel syncedAt={referenceState.syncedAt} />
+          : "En attente";
+
+  return (
+    <>
+      <section className="topbar audit-topbar">
+        <div>
+          <span className="eyebrow">Lecture intelligente</span>
+          <h1>Audits budget</h1>
+          <p>
+            Cette page cherche les signaux faibles et les points chauds du mois:
+            montants inhabituels, doublons probables, categories qui accelerent
+            et charges recurrentes a cadrer.
+          </p>
+        </div>
+
+        <div className="topbar-actions audit-topbar-actions">
+          <label className="audit-select-card">
+            <span>Base de comparaison</span>
+            <select
+              className="field-input"
+              value={referenceMonth}
+              onChange={(event) => onReferenceMonthChange(event.target.value)}
+            >
+              {monthOptions.map((month) => (
+                <option key={`audit-reference-${month.value}`} value={month.value}>
+                  {month.label}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <button type="button" className="outline-btn" onClick={onRefresh}>
+            {auditLoading ? "Actualisation..." : "Actualiser"}
+          </button>
+        </div>
+      </section>
+
+      <section className="content-grid audit-control-grid">
+        <article className="panel audit-period-panel">
+          <div className="panel-head">
+            <div>
+              <span className="panel-kicker">Periode analysee</span>
+              <h2>Choix du mois</h2>
+            </div>
+          </div>
+
+          <div className="panel-body">
+            {renderMonthFilter(selectedMonth, onMonthChange)}
+          </div>
+        </article>
+
+        <article className="panel audit-reference-panel">
+          <div className="panel-head">
+            <div>
+              <span className="panel-kicker">Contexte</span>
+              <h2>Base de lecture</h2>
+            </div>
+          </div>
+
+          <div className="panel-body stack">
+            <div className="audit-reference-grid">
+              <div className="audit-reference-card current">
+                <span>Mois audit</span>
+                <strong>{selectedMonthLabel}</strong>
+                <p>
+                  {loading || refreshing
+                    ? "Actualisation..."
+                    : lastSyncAt
+                      ? <LiveRelativeSyncLabel syncedAt={lastSyncAt} />
+                      : "Donnees en cours de lecture"}
+                </p>
+              </div>
+
+              <div className="audit-reference-card">
+                <span>Reference</span>
+                <strong>{referenceMonthLabel}</strong>
+                <p>{referenceSyncLabel}</p>
+              </div>
+            </div>
+
+            {sameReference ? (
+              <div className="status info">
+                Choisis un autre mois de reference pour faire ressortir les ecarts.
+              </div>
+            ) : null}
+
+            {referenceError ? (
+              <div className="status warn">
+                {referenceMonthLabel}: {referenceError}
+              </div>
+            ) : (
+              <div className="audit-reference-strip">
+                <span>{selectedMonthLabel} {euro.format(currentMetrics.total)}</span>
+                <strong className={totalDeltaTone}>
+                  {formatBudgetDifference(totalDelta)}
+                </strong>
+                <span>{referenceMonthLabel} {euro.format(referenceMetrics.total)}</span>
+              </div>
+            )}
+          </div>
+        </article>
+      </section>
+
+      {loading ? (
+        <div className="status info audit-inline-banner">
+          Lecture du mois en cours...
+        </div>
+      ) : null}
+
+      {!loading && error ? renderGoogleSheetsError(error) : null}
+
+      {!loading && !error && tickets.length === 0 ? (
+        <div className="status info audit-inline-banner">
+          Aucun ticket disponible pour {selectedMonthLabel.toLowerCase()}.
+        </div>
+      ) : null}
+
+      <section className="stats-grid audit-stats-grid">
+        <article className={`card ${report.statusTone === "ok" ? "accent-mint" : report.statusTone === "warning" ? "accent-gold" : "accent-salmon"}`}>
+          <span className="card-label">Score sante</span>
+          <strong className="card-value">{report.score}/100</strong>
+          <span className="card-sub">{report.statusLabel}</span>
+        </article>
+
+        <article className={`card ${totalDeltaTone === "warn" ? "accent-salmon" : totalDeltaTone === "ok" ? "accent-mint" : "accent-blue"}`}>
+          <span className="card-label">Ecart vs reference</span>
+          <strong className={`card-value audit-card-delta ${totalDeltaTone}`}>
+            {formatBudgetDifference(totalDelta)}
+          </strong>
+          <span className="card-sub">
+            {selectedMonthLabel} contre {referenceMonthLabel}
+          </span>
+        </article>
+
+        <article className="card accent-blue">
+          <span className="card-label">Montant sous loupe</span>
+          <strong className="card-value">{euro.format(report.underWatchTotal)}</strong>
+          <span className="card-sub">
+            {report.flaggedTickets.length} ticket(s) a relire
+          </span>
+        </article>
+
+        <article className="card accent-rose">
+          <span className="card-label">Charges recurrentes</span>
+          <strong className="card-value">{report.recurringCandidates.length}</strong>
+          <span className="card-sub">
+            {report.untrackedRecurringCount} non suivie(s) comme abonnement
+          </span>
+        </article>
+      </section>
+
+      <section className="content-grid audit-main-grid">
+        <article className="panel audit-alerts-panel">
+          <div className="panel-head">
+            <div>
+              <span className="panel-kicker">Priorite du mois</span>
+              <h2>Alertes et signaux</h2>
+            </div>
+          </div>
+
+          <div className="panel-body stack audit-alerts-list">
+            {report.alerts.slice(0, 6).map((alert) => (
+              <div
+                className={`audit-alert-item audit-alert-${alert.severity}`}
+                key={alert.id}
+              >
+                <div className="audit-alert-icon">{alert.icon}</div>
+                <div className="audit-alert-main">
+                  <strong>{alert.title}</strong>
+                  <span>{alert.detail}</span>
+                </div>
+                {typeof alert.amount === "number" ? (
+                  <strong className="audit-alert-amount">{euro.format(alert.amount)}</strong>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        </article>
+
+        <article className="panel audit-score-panel">
+          <div className="panel-head">
+            <div>
+              <span className="panel-kicker">Lecture manager</span>
+              <h2>Synthese du mois</h2>
+            </div>
+          </div>
+
+          <div className="panel-body stack">
+            <div className={`audit-score-card ${report.statusTone}`}>
+              <span>Etat global</span>
+              <strong>{report.statusLabel}</strong>
+              <p>
+                {report.statusTone === "ok"
+                  ? "Le mois reste assez stable avec peu de signaux chauds."
+                  : report.statusTone === "warning"
+                    ? "Quelques points demandent une relecture avant qu ils ne deviennent structurels."
+                    : "Plusieurs signaux se cumulent. Il vaut mieux regarder le detail maintenant."}
+              </p>
+            </div>
+
+            <div className="audit-breakdown-grid">
+              <div className="audit-breakdown-tile critical">
+                <span>Critiques</span>
+                <strong>{report.criticalCount}</strong>
+              </div>
+              <div className="audit-breakdown-tile warning">
+                <span>Warnings</span>
+                <strong>{report.warningCount}</strong>
+              </div>
+              <div className="audit-breakdown-tile ok">
+                <span>Points verts</span>
+                <strong>{report.okCount}</strong>
+              </div>
+              <div className="audit-breakdown-tile neutral">
+                <span>Doublons</span>
+                <strong>{report.duplicateGroupCount}</strong>
+              </div>
+            </div>
+
+            <div className="audit-summary-list">
+              <div className="audit-summary-row">
+                <span>Reste en cours</span>
+                <strong>{euro.format(currentMetrics.currentRemaining)}</strong>
+              </div>
+              <div className="audit-summary-row">
+                <span>Depense non prevue</span>
+                <strong className={getBudgetDifferenceTone(currentMetrics.unexpectedSpend)}>
+                  {formatBudgetDifference(currentMetrics.unexpectedSpend)}
+                </strong>
+              </div>
+              <div className="audit-summary-row">
+                <span>Tickets inhabituels</span>
+                <strong>{report.outlierCount}</strong>
+              </div>
+              <div className="audit-summary-row">
+                <span>Tickets en attente</span>
+                <strong>{currentMetrics.pendingCount}</strong>
+              </div>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <section className="content-grid audit-detail-grid">
+        <article className="panel audit-category-panel">
+          <div className="panel-head">
+            <div>
+              <span className="panel-kicker">Categories qui bougent</span>
+              <h2>Radar categories</h2>
+            </div>
+          </div>
+
+          <div className="panel-body audit-category-list">
+            {report.categoryDeltas.slice(0, 7).map((row) => {
+              const tone = getBudgetDifferenceTone(row.delta);
+
+              return (
+                <div className="audit-category-row" key={`audit-category-${row.category}`}>
+                  <div className="audit-category-main">
+                    <strong>{row.category}</strong>
+                    <span>
+                      {selectedMonthLabel} {euro.format(row.currentAmount)} vs {referenceMonthLabel} {euro.format(row.referenceAmount)}
+                    </span>
+                  </div>
+                  <strong className={`audit-category-delta ${tone}`}>
+                    {formatBudgetDifference(row.delta)}
+                  </strong>
+                </div>
+              );
+            })}
+
+            {report.categoryDeltas.length === 0 ? (
+              <div className="status info">
+                Les deltas de categories apparaitront ici des que les deux mois auront des donnees.
+              </div>
+            ) : null}
+          </div>
+        </article>
+
+        <article className="panel audit-recurring-panel">
+          <div className="panel-head">
+            <div>
+              <span className="panel-kicker">Repetition</span>
+              <h2>Charges recurrentes</h2>
+            </div>
+          </div>
+
+          <div className="panel-body audit-recurring-list">
+            {report.recurringCandidates.slice(0, 6).map((item) => (
+              <div className="audit-recurring-row" key={`audit-recurring-${item.key}`}>
+                <div className="audit-recurring-main">
+                  <strong>{item.label}</strong>
+                  <span>
+                    {item.category} • {selectedMonthLabel} {euro.format(item.currentAmount)} • {referenceMonthLabel} {euro.format(item.referenceAmount)}
+                  </span>
+                </div>
+
+                <div className="audit-recurring-side">
+                  <span className={`audit-recurring-tag ${item.tracked ? "tracked" : "untracked"}`}>
+                    {item.tracked ? `Suivi: ${item.trackedLabel}` : "A cadrer"}
+                  </span>
+                  <strong className={getBudgetDifferenceTone(item.delta)}>
+                    {formatBudgetDifference(item.delta)}
+                  </strong>
+                </div>
+              </div>
+            ))}
+
+            {report.recurringCandidates.length === 0 ? (
+              <div className="status info">
+                Aucune charge recurrente claire n a ete detectee entre ces deux mois.
+              </div>
+            ) : null}
+          </div>
+        </article>
+      </section>
+
+      <section className="panel audit-flagged-panel">
+        <div className="panel-head">
+          <div>
+            <span className="panel-kicker">Tickets a relire</span>
+            <h2>Montants et mouvements sous surveillance</h2>
+          </div>
+        </div>
+
+        <div className="panel-body audit-flagged-list">
+          {report.flaggedTickets.slice(0, 8).map((item) => (
+            <div
+              className={`audit-flagged-row audit-flagged-${item.severity}`}
+              key={`audit-flagged-${item.key}`}
+            >
+              <div className="audit-flagged-main">
+                <strong>{item.ticket.description || "Sans description"}</strong>
+                <span>
+                  {item.ticket.date || "Sans date"} • {item.ticket.category || "Sans categorie"}
+                </span>
+                <p>{item.reason}</p>
+              </div>
+
+              <div className="audit-flagged-side">
+                <span className={`ticket-badge ${item.ticket.sent ? "sent" : "pending"}`}>
+                  {item.ticket.sent ? "Envoye" : "En attente"}
+                </span>
+                <strong>{euro.format(item.ticket.amount)}</strong>
+              </div>
+            </div>
+          ))}
+
+          {report.flaggedTickets.length === 0 ? (
+            <div className="status ok">
+              Aucun ticket ne ressort comme inhabituel ou duplique pour le moment.
+            </div>
+          ) : null}
+        </div>
+      </section>
+    </>
+  );
+}
+
+function renderCompare(
+  primaryMonth: string,
+  secondaryMonth: string,
+  primaryState: CompareMonthState,
+  secondaryState: CompareMonthState,
+  compareSortMode: CompareSortMode,
+  selectedMonth: string,
+  subscriptions: DashboardSubscription[],
+  onPrimaryMonthChange: (month: string) => void,
+  onSecondaryMonthChange: (month: string) => void,
+  onSwapMonths: () => void,
+  onSyncWithSelectedMonth: () => void,
+  onRefreshCompare: () => void,
+  onCompareSortModeChange: (mode: CompareSortMode) => void
+) {
+  const primaryLabel = getSelectedMonthLabel(primaryMonth);
+  const secondaryLabel = getSelectedMonthLabel(secondaryMonth);
+  const primaryMetrics = buildCompareMonthMetrics(primaryState.tickets, primaryState.summary);
+  const secondaryMetrics = buildCompareMonthMetrics(secondaryState.tickets, secondaryState.summary);
+  const categoryRows = buildCategoryCompareRows(
+    primaryState.tickets,
+    secondaryState.tickets,
+    compareSortMode
+  );
+  const budgetRows = ticketsFinancePreset.budgetLines
+    .map((line) => {
+      const primaryLine = primaryMetrics.budgetLines.find((item) => item.key === line.key);
+      const secondaryLine = secondaryMetrics.budgetLines.find((item) => item.key === line.key);
+      const primaryActual = primaryLine?.actual ?? 0;
+      const secondaryActual = secondaryLine?.actual ?? 0;
+
+      return {
+        key: line.key,
+        label: line.label,
+        planned: line.planned,
+        primaryActual,
+        secondaryActual,
+        delta: primaryActual - secondaryActual,
+      };
+    })
+    .sort((left, right) => Math.abs(right.delta) - Math.abs(left.delta));
+
+  const totalDelta = primaryMetrics.total - secondaryMetrics.total;
+  const remainingDelta = primaryMetrics.currentRemaining - secondaryMetrics.currentRemaining;
+  const totalDeltaTone = getBudgetDifferenceTone(totalDelta);
+  const remainingDeltaTone =
+    remainingDelta > 0.009 ? "ok" : remainingDelta < -0.009 ? "warn" : "neutral";
+  const sameMonth = primaryMonth === secondaryMonth;
+  const compareLoading = primaryState.loading || secondaryState.loading;
+  const primaryReady = primaryState.syncedAt !== null || Boolean(primaryState.error);
+  const secondaryReady = secondaryState.syncedAt !== null || Boolean(secondaryState.error);
+  const pairReady = primaryReady && secondaryReady;
+  const categoriesWithMovement = categoryRows.filter((row) => row.absoluteDelta > 0.009).length;
+  const topIncrease =
+    [...categoryRows]
+      .filter((row) => row.delta > 0.009)
+      .sort((left, right) => right.delta - left.delta)[0] ?? null;
+  const topDecrease =
+    [...categoryRows]
+      .filter((row) => row.delta < -0.009)
+      .sort((left, right) => left.delta - right.delta)[0] ?? null;
+  const newCategories = categoryRows.filter(
+    (row) => row.secondaryAmount <= 0.009 && row.primaryAmount > 0.009
+  );
+  const missingCategories = categoryRows.filter(
+    (row) => row.primaryAmount <= 0.009 && row.secondaryAmount > 0.009
+  );
+  const subscriptionsTotal = subscriptions.reduce((sum, item) => sum + item.amount, 0);
+  const subscriptionsSharePrimary =
+    primaryMetrics.total > 0 ? Math.round((subscriptionsTotal / primaryMetrics.total) * 100) : 0;
+  const subscriptionsShareSecondary =
+    secondaryMetrics.total > 0 ? Math.round((subscriptionsTotal / secondaryMetrics.total) * 100) : 0;
+  const maxAbsoluteDelta = categoryRows.reduce(
+    (max, row) => Math.max(max, row.absoluteDelta),
+    0
+  );
+
+  const getSyncLabel = (state: CompareMonthState) => {
+    if (state.loading && state.syncedAt === null) {
+      return "Chargement...";
+    }
+
+    if (state.loading) {
+      return "Actualisation...";
+    }
+
+    if (!state.syncedAt) {
+      return "En attente";
+    }
+
+    return <LiveRelativeSyncLabel syncedAt={state.syncedAt} />;
+  };
+
+  const getMonthLeadClass = (monthTotal: number, otherMonthTotal: number) => {
+    if (monthTotal > otherMonthTotal + 0.009) return "lead";
+    if (monthTotal < otherMonthTotal - 0.009) return "trail";
+    return "neutral";
+  };
+
+  const totalDeltaCardClass =
+    totalDeltaTone === "warn"
+      ? "accent-salmon"
+      : totalDeltaTone === "ok"
+        ? "accent-mint"
+        : "accent-blue";
+  const remainingDeltaCardClass =
+    remainingDeltaTone === "ok"
+      ? "accent-mint"
+      : remainingDeltaTone === "warn"
+        ? "accent-salmon"
+        : "accent-gold";
+  const selectedMonthLabel = getSelectedMonthLabel(selectedMonth);
+
+  return (
+    <>
+      <section className="topbar compare-topbar">
+        <div>
+          <span className="eyebrow">Comparaison live</span>
+          <h1>Comparateur mensuel</h1>
+          <p>
+            Mets deux mois face a face pour voir ce qui grimpe, ce qui se calme
+            et quelles categories changent vraiment la physionomie du budget.
+          </p>
+        </div>
+
+        <div className="topbar-actions compare-topbar-actions">
+          <label className="compare-select-card">
+            <span>Mois A</span>
+            <select
+              className="field-input"
+              value={primaryMonth}
+              onChange={(event) => onPrimaryMonthChange(event.target.value)}
+            >
+              {monthOptions.map((month) => (
+                <option key={`compare-primary-${month.value}`} value={month.value}>
+                  {month.label}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <button type="button" className="ghost-btn compare-swap-btn" onClick={onSwapMonths}>
+            Inverser
+          </button>
+
+          <label className="compare-select-card">
+            <span>Mois B</span>
+            <select
+              className="field-input"
+              value={secondaryMonth}
+              onChange={(event) => onSecondaryMonthChange(event.target.value)}
+            >
+              {monthOptions.map((month) => (
+                <option key={`compare-secondary-${month.value}`} value={month.value}>
+                  {month.label}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <button type="button" className="ghost-btn" onClick={onSyncWithSelectedMonth}>
+            Utiliser {selectedMonthLabel}
+          </button>
+
+          <button type="button" className="outline-btn" onClick={onRefreshCompare}>
+            {compareLoading ? "Actualisation..." : "Actualiser"}
+          </button>
+        </div>
+      </section>
+
+      {sameMonth ? (
+        <div className="status info compare-inline-banner">
+          Tu compares actuellement {primaryLabel.toLowerCase()} avec le meme mois.
+          Choisis une autre periode pour faire ressortir les ecarts.
+        </div>
+      ) : null}
+
+      {compareLoading ? (
+        <div className="status info compare-inline-banner">
+          Le comparateur recharge les donnees des deux mois.
+        </div>
+      ) : null}
+
+      {primaryState.error ? (
+        <div className="status warn compare-inline-banner">
+          {primaryLabel}: {primaryState.error}
+        </div>
+      ) : null}
+
+      {secondaryState.error ? (
+        <div className="status warn compare-inline-banner">
+          {secondaryLabel}: {secondaryState.error}
+        </div>
+      ) : null}
+
+      <section className="stats-grid compare-stats-grid">
+        <article className={`card ${totalDeltaCardClass}`}>
+          <span className="card-label">Delta depenses</span>
+          <strong className={`card-value compare-card-delta ${totalDeltaTone}`}>
+            {pairReady ? formatBudgetDifference(totalDelta) : "..."}
+          </strong>
+          <span className="card-sub">
+            {sameMonth
+              ? "Selection identique pour le moment."
+              : totalDelta > 0.009
+                ? `${primaryLabel} coute plus cher que ${secondaryLabel}.`
+                : totalDelta < -0.009
+                  ? `${primaryLabel} est plus leger que ${secondaryLabel}.`
+                  : "Les deux mois restent tres proches."}
+          </span>
+        </article>
+
+        <article className="card accent-blue">
+          <span className="card-label">Ticket moyen</span>
+          <strong className="card-value">
+            {pairReady ? euro.format(primaryMetrics.averageTicket) : "..."}
+          </strong>
+          <span className="card-sub">
+            {pairReady
+              ? `${primaryLabel} vs ${euro.format(secondaryMetrics.averageTicket)} sur ${secondaryLabel}`
+              : "Calcul en cours"}
+          </span>
+        </article>
+
+        <article className={`card ${remainingDeltaCardClass}`}>
+          <span className="card-label">Reste en cours</span>
+          <strong className={`card-value compare-card-delta ${remainingDeltaTone}`}>
+            {pairReady ? formatBudgetDifference(remainingDelta) : "..."}
+          </strong>
+          <span className="card-sub">
+            {pairReady
+              ? `${euro.format(primaryMetrics.currentRemaining)} vs ${euro.format(secondaryMetrics.currentRemaining)}`
+              : "Synthese Sheets en attente"}
+          </span>
+        </article>
+
+        <article className="card accent-rose">
+          <span className="card-label">Categories en mouvement</span>
+          <strong className="card-value">
+            {pairReady ? String(categoriesWithMovement) : "..."}
+          </strong>
+          <span className="card-sub">
+            {topIncrease
+              ? `${topIncrease.category} mene la variation.`
+              : "Aucun ecart categorie detecte pour le moment."}
+          </span>
+        </article>
+      </section>
+
+      <section className="content-grid compare-overview-grid">
+        <article className="panel compare-duel-panel">
+          <div className="panel-head">
+            <div>
+              <span className="panel-kicker">Face a face</span>
+              <h2>Duel des mois</h2>
+            </div>
+          </div>
+
+          <div className="panel-body compare-duel-body">
+            <div
+              className={`compare-month-card ${getMonthLeadClass(primaryMetrics.total, secondaryMetrics.total)}`}
+            >
+              <div className="compare-month-card-head">
+                <div>
+                  <span className="panel-kicker">Mois A</span>
+                  <strong>{primaryLabel}</strong>
+                </div>
+                <span className="compare-month-sync">{getSyncLabel(primaryState)}</span>
+              </div>
+
+              <strong className="compare-month-total">
+                {primaryReady ? euro.format(primaryMetrics.total) : "..."}
+              </strong>
+
+              <div className="compare-month-meta">
+                <span>{primaryReady ? `${primaryMetrics.ticketCount} ticket(s)` : "..."}</span>
+                <span>{primaryReady ? `${Math.round(primaryMetrics.sentRatio)}% envoyes` : "..."}</span>
+              </div>
+
+              <div className="compare-month-progress">
+                <div className="compare-month-progress-head">
+                  <span>Budget utilise</span>
+                  <strong>
+                    {primaryReady ? `${Math.round(primaryMetrics.budgetUsagePercent)}%` : "..."}
+                  </strong>
+                </div>
+                <div className="compare-month-track">
+                  <div
+                    className={`compare-month-fill ${primaryMetrics.budgetUsagePercent > 85 ? "warn" : "ok"}`}
+                    style={{ width: `${primaryReady ? primaryMetrics.budgetUsagePercent : 0}%` }}
+                  />
+                </div>
+              </div>
+
+              <div className="compare-month-note">
+                <span>Ticket marquant</span>
+                <strong>
+                  {primaryMetrics.largestTicket
+                    ? `${primaryMetrics.largestTicket.description || "Sans description"} • ${euro.format(primaryMetrics.largestTicket.amount)}`
+                    : "Aucun ticket pour ce mois"}
+                </strong>
+                <p>
+                  {primaryMetrics.largestTicket
+                    ? `${primaryMetrics.largestTicket.category || "Sans categorie"} • ${primaryMetrics.largestTicket.date || "Date indisponible"}`
+                    : "La comparaison reste disponible meme sur un mois vide."}
+                </p>
+              </div>
+            </div>
+
+            <div className="compare-vs-pill">
+              <span>Delta global</span>
+              <strong className={totalDeltaTone}>
+                {pairReady ? formatBudgetDifference(totalDelta) : "..."}
+              </strong>
+              <p>{primaryLabel} vs {secondaryLabel}</p>
+            </div>
+
+            <div
+              className={`compare-month-card ${getMonthLeadClass(secondaryMetrics.total, primaryMetrics.total)}`}
+            >
+              <div className="compare-month-card-head">
+                <div>
+                  <span className="panel-kicker">Mois B</span>
+                  <strong>{secondaryLabel}</strong>
+                </div>
+                <span className="compare-month-sync">{getSyncLabel(secondaryState)}</span>
+              </div>
+
+              <strong className="compare-month-total">
+                {secondaryReady ? euro.format(secondaryMetrics.total) : "..."}
+              </strong>
+
+              <div className="compare-month-meta">
+                <span>{secondaryReady ? `${secondaryMetrics.ticketCount} ticket(s)` : "..."}</span>
+                <span>{secondaryReady ? `${Math.round(secondaryMetrics.sentRatio)}% envoyes` : "..."}</span>
+              </div>
+
+              <div className="compare-month-progress">
+                <div className="compare-month-progress-head">
+                  <span>Budget utilise</span>
+                  <strong>
+                    {secondaryReady ? `${Math.round(secondaryMetrics.budgetUsagePercent)}%` : "..."}
+                  </strong>
+                </div>
+                <div className="compare-month-track">
+                  <div
+                    className={`compare-month-fill ${secondaryMetrics.budgetUsagePercent > 85 ? "warn" : "ok"}`}
+                    style={{ width: `${secondaryReady ? secondaryMetrics.budgetUsagePercent : 0}%` }}
+                  />
+                </div>
+              </div>
+
+              <div className="compare-month-note">
+                <span>Ticket marquant</span>
+                <strong>
+                  {secondaryMetrics.largestTicket
+                    ? `${secondaryMetrics.largestTicket.description || "Sans description"} • ${euro.format(secondaryMetrics.largestTicket.amount)}`
+                    : "Aucun ticket pour ce mois"}
+                </strong>
+                <p>
+                  {secondaryMetrics.largestTicket
+                    ? `${secondaryMetrics.largestTicket.category || "Sans categorie"} • ${secondaryMetrics.largestTicket.date || "Date indisponible"}`
+                    : "Tu peux garder ce mois comme point de comparaison neutre."}
+                </p>
+              </div>
+            </div>
+          </div>
+        </article>
+
+        <article className="panel compare-insights-panel">
+          <div className="panel-head">
+            <div>
+              <span className="panel-kicker">Lecture rapide</span>
+              <h2>Ce qui change</h2>
+            </div>
+          </div>
+
+          <div className="panel-body stack compare-insights-list">
+            <div className="activity-item simple compare-insight-item">
+              <div>
+                <strong>
+                  {topIncrease ? `Hausse la plus visible: ${topIncrease.category}` : "Aucune hausse marquante"}
+                </strong>
+                <span>
+                  {topIncrease
+                    ? `${primaryLabel} depense ${formatBudgetDifference(topIncrease.delta)} de plus que ${secondaryLabel}.`
+                    : "Aucune categorie ne tire franchement le budget vers le haut."}
+                </span>
+              </div>
+            </div>
+
+            <div className="activity-item simple compare-insight-item">
+              <div>
+                <strong>
+                  {topDecrease ? `Baisse la plus nette: ${topDecrease.category}` : "Aucune baisse marquante"}
+                </strong>
+                <span>
+                  {topDecrease
+                    ? `${primaryLabel} economise ${formatBudgetDifference(Math.abs(topDecrease.delta))} sur ce poste.`
+                    : "Le niveau de depense reste proche sur les categories actives."}
+                </span>
+              </div>
+            </div>
+
+            <div className="activity-item simple compare-insight-item">
+              <div>
+                <strong>
+                  {newCategories.length > 0
+                    ? `${newCategories.length} nouvelle(s) categorie(s) sur ${primaryLabel}`
+                    : `Aucune nouvelle categorie sur ${primaryLabel}`}
+                </strong>
+                <span>
+                  {newCategories.length > 0
+                    ? newCategories.slice(0, 3).map((row) => row.category).join(" • ")
+                    : `${primaryLabel} conserve les memes grandes familles que ${secondaryLabel}.`}
+                </span>
+              </div>
+            </div>
+
+            <div className="activity-item simple compare-insight-item">
+              <div>
+                <strong>
+                  {missingCategories.length > 0
+                    ? `${missingCategories.length} categorie(s) absente(s) sur ${primaryLabel}`
+                    : `Aucune categorie ne disparait sur ${primaryLabel}`}
+                </strong>
+                <span>
+                  {missingCategories.length > 0
+                    ? missingCategories.slice(0, 3).map((row) => row.category).join(" • ")
+                    : "Le panorama de depenses reste complet d un mois a l autre."}
+                </span>
+              </div>
+            </div>
+
+            <div className="activity-item simple compare-insight-item">
+              <div>
+                <strong>
+                  {subscriptionsTotal > 0
+                    ? `${euro.format(subscriptionsTotal)}/mois d abonnements actifs aujourd hui`
+                    : "Aucun abonnement actif en memoire locale"}
+                </strong>
+                <span>
+                  {subscriptionsTotal > 0
+                    ? `Si tu les reconduis a l identique, cela pese ${subscriptionsSharePrimary}% de ${primaryLabel.toLowerCase()} et ${subscriptionsShareSecondary}% de ${secondaryLabel.toLowerCase()}.`
+                    : "Ajoute des abonnements dans le dashboard pour lire aussi leur poids mensuel ici."}
+                </span>
+              </div>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <section className="panel compare-table-panel">
+        <div className="panel-head">
+          <div>
+            <span className="panel-kicker">{categoryRows.length} categorie(s) comparee(s)</span>
+            <h2>Ecarts par categorie</h2>
+          </div>
+
+          <div className="compare-sort-pills">
+            <button
+              type="button"
+              className={`compare-sort-pill ${compareSortMode === "delta" ? "active" : ""}`}
+              onClick={() => onCompareSortModeChange("delta")}
+            >
+              Ecart
+            </button>
+            <button
+              type="button"
+              className={`compare-sort-pill ${compareSortMode === "primary" ? "active" : ""}`}
+              onClick={() => onCompareSortModeChange("primary")}
+            >
+              {primaryLabel}
+            </button>
+            <button
+              type="button"
+              className={`compare-sort-pill ${compareSortMode === "secondary" ? "active" : ""}`}
+              onClick={() => onCompareSortModeChange("secondary")}
+            >
+              {secondaryLabel}
+            </button>
+          </div>
+        </div>
+
+        <div className="panel-body">
+          {categoryRows.length === 0 ? (
+            <div className="status info">
+              Les categories apparaitront ici des que les deux mois auront des donnees a comparer.
+            </div>
+          ) : (
+            <div className="compare-table">
+              <div className="compare-table-head">
+                <span>Categorie</span>
+                <span>{primaryLabel}</span>
+                <span>{secondaryLabel}</span>
+                <span>Ecart</span>
+                <span>Impact</span>
+              </div>
+
+              {categoryRows.slice(0, 12).map((row) => {
+                const tone = getBudgetDifferenceTone(row.delta);
+                const impactWidth =
+                  maxAbsoluteDelta > 0
+                    ? Math.max(6, (row.absoluteDelta / maxAbsoluteDelta) * 100)
+                    : 0;
+
+                return (
+                  <div className="compare-table-row" key={`compare-row-${row.category}`}>
+                    <div className="compare-table-category">
+                      <strong>{row.category}</strong>
+                      <span>
+                        {row.primaryCount} ticket(s) vs {row.secondaryCount}
+                      </span>
+                    </div>
+
+                    <span className="compare-table-value">{euro.format(row.primaryAmount)}</span>
+                    <span className="compare-table-value">{euro.format(row.secondaryAmount)}</span>
+                    <span className={`compare-table-delta ${tone}`}>
+                      {formatBudgetDifference(row.delta)}
+                    </span>
+
+                    <div className="compare-impact-cell">
+                      <div className="compare-impact-track">
+                        <div
+                          className={`compare-impact-fill ${tone}`}
+                          style={{ width: `${impactWidth}%` }}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </section>
+
+      <section className="content-grid compare-detail-grid">
+        <article className="panel compare-budget-panel">
+          <div className="panel-head">
+            <div>
+              <span className="panel-kicker">Budget cible</span>
+              <h2>Lignes sous tension</h2>
+            </div>
+          </div>
+
+          <div className="panel-body compare-budget-list">
+            {budgetRows.slice(0, 6).map((row) => {
+              const tone = getBudgetDifferenceTone(row.delta);
+
+              return (
+                <div className="compare-budget-row" key={`compare-budget-${row.key}`}>
+                  <div className="compare-budget-main">
+                    <strong>{row.label}</strong>
+                    <div className="compare-budget-values">
+                      <span className="compare-budget-chip">Cible {euro.format(row.planned)}</span>
+                      <span className="compare-budget-chip">{primaryLabel} {euro.format(row.primaryActual)}</span>
+                      <span className="compare-budget-chip">{secondaryLabel} {euro.format(row.secondaryActual)}</span>
+                    </div>
+                  </div>
+
+                  <strong className={`compare-budget-delta ${tone}`}>
+                    {formatBudgetDifference(row.delta)}
+                  </strong>
+                </div>
+              );
+            })}
+          </div>
+        </article>
+
+        <article className="panel compare-notes-panel">
+          <div className="panel-head">
+            <div>
+              <span className="panel-kicker">Points fixes</span>
+              <h2>Repere rapide</h2>
+            </div>
+          </div>
+
+          <div className="panel-body stack compare-note-stack">
+            <div className="compare-note-card">
+              <span>Depense non prevue</span>
+              <strong>
+                {pairReady
+                  ? `${primaryLabel}: ${formatBudgetDifference(primaryMetrics.unexpectedSpend)}`
+                  : "Calcul en cours"}
+              </strong>
+              <p>
+                {pairReady
+                  ? `${secondaryLabel}: ${formatBudgetDifference(secondaryMetrics.unexpectedSpend)}`
+                  : "Le delta reel vs theorique sera affiche ici."}
+              </p>
+            </div>
+
+            <div className="compare-note-card">
+              <span>Ticket marquant {primaryLabel}</span>
+              <strong>
+                {primaryMetrics.largestTicket
+                  ? euro.format(primaryMetrics.largestTicket.amount)
+                  : "Aucune depense"}
+              </strong>
+              <p>
+                {primaryMetrics.largestTicket
+                  ? `${primaryMetrics.largestTicket.description || "Sans description"} • ${primaryMetrics.largestTicket.category || "Sans categorie"}`
+                  : "Ce mois ne contient pas encore de ticket a mettre en avant."}
+              </p>
+            </div>
+
+            <div className="compare-note-card">
+              <span>Ticket marquant {secondaryLabel}</span>
+              <strong>
+                {secondaryMetrics.largestTicket
+                  ? euro.format(secondaryMetrics.largestTicket.amount)
+                  : "Aucune depense"}
+              </strong>
+              <p>
+                {secondaryMetrics.largestTicket
+                  ? `${secondaryMetrics.largestTicket.description || "Sans description"} • ${secondaryMetrics.largestTicket.category || "Sans categorie"}`
+                  : "Tu peux garder ce mois comme base neutre ou en choisir un autre."}
+              </p>
+            </div>
+
+            <div className="compare-note-card">
+              <span>Cadence de tickets</span>
+              <strong>
+                {pairReady
+                  ? `${primaryMetrics.ticketCount} sur ${primaryLabel} vs ${secondaryMetrics.ticketCount} sur ${secondaryLabel}`
+                  : "Lecture en attente"}
+              </strong>
+              <p>
+                {pairReady
+                  ? `${primaryMetrics.pendingCount} en attente sur ${primaryLabel}, ${secondaryMetrics.pendingCount} sur ${secondaryLabel}.`
+                  : "Les volumes et les tickets en attente apparaitront ici."}
+              </p>
+            </div>
+          </div>
+        </article>
+      </section>
     </>
   );
 }
@@ -3556,6 +6144,31 @@ function renderSettings(
 
 const patchNotesData: { version: string; date: string; notes: string[] }[] = [
   {
+    version: "0.1.22",
+    date: "2026-04-22",
+    notes: [
+      "Refonte de l'affichage de synchronisation (temps reel depuis la derniere actualisation)",
+      "Correction des valeurs affichees dans les cartes (coherence des donnees restauree)",
+      "Amelioration du rendu global du dashboard (espacement, lisibilite, structure, fonds des cadres)",
+      "Cadre Audit initialise (base fonctionnelle en place)",
+      "Depenses non prevues desormais cliquables (acces au detail)",
+      "Comparateur fonctionnel (a peaufiner)",
+      "Suppression des sous-titres dans les cartes solde / reste en cours / reste theorique / depenses non prevues",
+      "Tickets : ajout du bouton Vue feuille pour acces rapide a l'ensemble des tickets",
+    ],
+  },
+  {
+    version: "0.1.21",
+    date: "2026-04-22",
+    notes: [
+      "Correction et amelioration de l'affichage des cartes Courses et Essence sur le dashboard",
+      "Amelioration du menu Admin (ergonomie, gestion des roles, acces, a ameliorer)",
+      "Modification du systeme de tickets (ajout, edition, suivi)",
+      "Ajout de la creation de ticket (fonctionnelle mais a ameliorer)",
+      "Divers correctifs et ajustements visuels",
+    ],
+  },
+  {
     version: "0.1.20",
     date: "2026-04-14",
     notes: [
@@ -3653,33 +6266,137 @@ function renderAdminPage(
   adminLoading: boolean,
   adminError: string,
   onLoadUsers: () => void,
-  onToggleRole: (targetEmail: string, newRole: "admin" | "user") => void
+  onToggleRole: (targetEmail: string, newRole: "admin" | "user") => void,
+  handleOpenPermissions: (user: AccountProfile) => void,
+  collaborators: Collaborator[],
+  adminSearch: string,
+  onAdminSearchChange: (v: string) => void,
+  adminRoleFilter: "all" | "founder" | "admin" | "user",
+  onAdminRoleFilterChange: (v: "all" | "founder" | "admin" | "user") => void
 ) {
-  if (currentAccount.role !== "admin") {
+  if (!isPrivileged(currentAccount)) {
     return (
       <section className="panel admin-blocked-panel">
         <div className="admin-blocked">
+          <div className="admin-blocked-glow" />
           <span className="admin-blocked-icon">🔒</span>
-          <h2>Acces restreint</h2>
-          <p>Cette section est reservee aux administrateurs.</p>
+          <h2>Zone reservee</h2>
+          <p className="admin-blocked-desc">Cette section est uniquement accessible aux <strong>administrateurs</strong> et au <strong>fondateur</strong> de l'application.</p>
+          <p className="admin-blocked-hint">Votre compte : <strong>{currentAccount.pseudo || currentAccount.email}</strong></p>
+          <span className="admin-blocked-role">{currentAccount.role === "user" ? "Utilisateur" : currentAccount.role}</span>
         </div>
       </section>
     );
   }
 
-  return (
-    <section className="panel admin-panel">
-      <div className="admin-header">
-        <div>
-          <h1>Administration</h1>
-          <p className="admin-subtitle">Gestion des comptes et autorisations</p>
-        </div>
-        <button className="primary-btn" onClick={onLoadUsers} disabled={adminLoading}>
-          {adminLoading ? "Chargement..." : "Rafraichir"}
-        </button>
-      </div>
+  const totalUsers = adminUsers.length;
+  const totalAdmins = adminUsers.filter((u) => u.role === "admin").length;
+  const totalFounders = adminUsers.filter((u) => u.role === "founder").length;
+  const onlineCount = collaborators.length + 1;
+  const recentUsers = adminUsers.filter((u) => {
+    if (!u.createdAt) return false;
+    const diff = Date.now() - new Date(u.createdAt).getTime();
+    return diff < 7 * 24 * 60 * 60 * 1000;
+  }).length;
 
-      {adminError && <div className="admin-error">{adminError}</div>}
+  const searchLower = adminSearch.toLowerCase();
+  const filteredUsers = adminUsers.filter((u) => {
+    if (adminRoleFilter !== "all" && u.role !== adminRoleFilter) return false;
+    if (!searchLower) return true;
+    return (
+      (u.pseudo || "").toLowerCase().includes(searchLower) ||
+      (u.firstName || "").toLowerCase().includes(searchLower) ||
+      (u.lastName || "").toLowerCase().includes(searchLower) ||
+      u.email.toLowerCase().includes(searchLower)
+    );
+  });
+
+  const isFounder = currentAccount.role === "founder";
+
+  return (
+    <div className="admin-panel-layout">
+      <section className="admin-hero-panel">
+        <div className="admin-hero-bg" />
+        <div className="admin-hero-content">
+          <div className="admin-hero-text">
+            <span className="admin-hero-eyebrow">⚙️ Administration</span>
+            <h1>Panneau d'administration</h1>
+            <p>Gerez les comptes, roles et permissions de votre equipe.</p>
+          </div>
+          <button className="primary-btn admin-hero-refresh" onClick={onLoadUsers} disabled={adminLoading}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>
+            {adminLoading ? "Chargement..." : "Rafraichir"}
+          </button>
+        </div>
+      </section>
+
+      {adminError && <div className="admin-error admin-error-bar">{adminError}</div>}
+
+      <section className="admin-stats-row">
+        <div className="admin-stat-card">
+          <span className="admin-stat-icon">👥</span>
+          <div className="admin-stat-body">
+            <span className="admin-stat-value">{totalUsers}</span>
+            <span className="admin-stat-label">Utilisateurs</span>
+          </div>
+        </div>
+        <div className="admin-stat-card admin-stat-gold">
+          <span className="admin-stat-icon">🛡️</span>
+          <div className="admin-stat-body">
+            <span className="admin-stat-value">{totalAdmins}</span>
+            <span className="admin-stat-label">Admins</span>
+          </div>
+        </div>
+        <div className="admin-stat-card admin-stat-founder">
+          <span className="admin-stat-icon">👑</span>
+          <div className="admin-stat-body">
+            <span className="admin-stat-value">{totalFounders}</span>
+            <span className="admin-stat-label">Fondateur</span>
+          </div>
+        </div>
+        <div className="admin-stat-card admin-stat-mint">
+          <span className="admin-stat-icon">🟢</span>
+          <div className="admin-stat-body">
+            <span className="admin-stat-value">{onlineCount}</span>
+            <span className="admin-stat-label">En ligne</span>
+          </div>
+        </div>
+        <div className="admin-stat-card admin-stat-sky">
+          <span className="admin-stat-icon">🆕</span>
+          <div className="admin-stat-body">
+            <span className="admin-stat-value">{recentUsers}</span>
+            <span className="admin-stat-label">Nouveaux (7j)</span>
+          </div>
+        </div>
+      </section>
+
+      <section className="admin-toolbar">
+        <div className="admin-search-wrapper">
+          <svg className="admin-search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+          <input
+            className="admin-search-input"
+            type="text"
+            placeholder="Rechercher un utilisateur..."
+            value={adminSearch}
+            onChange={(e) => onAdminSearchChange(e.target.value)}
+          />
+          {adminSearch && (
+            <button className="admin-search-clear" onClick={() => onAdminSearchChange("")}>✕</button>
+          )}
+        </div>
+        <div className="admin-filter-pills">
+          {([["all", "Tous"], ["founder", "Fondateur"], ["admin", "Admins"], ["user", "Utilisateurs"]] as const).map(([val, label]) => (
+            <button
+              key={val}
+              className={`admin-filter-pill ${adminRoleFilter === val ? "active" : ""}`}
+              onClick={() => onAdminRoleFilterChange(val)}
+            >
+              {label}
+              {val !== "all" && <span className="admin-filter-count">{adminUsers.filter((u) => u.role === val).length}</span>}
+            </button>
+          ))}
+        </div>
+      </section>
 
       {adminUsers.length === 0 && !adminLoading && !adminError && (
         <div className="admin-empty">
@@ -3687,65 +6404,91 @@ function renderAdminPage(
         </div>
       )}
 
-      {adminUsers.length > 0 && (
-        <div className="admin-table-wrapper">
-          <table className="admin-table">
-            <thead>
-              <tr>
-                <th>Pseudo</th>
-                <th>Prenom</th>
-                <th>Nom</th>
-                <th>Email</th>
-                <th>Couleur</th>
-                <th>Role</th>
-                <th>Inscrit le</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {adminUsers.map((user) => {
-                const isSelf = user.email === currentAccount.email;
-                return (
-                  <tr key={user.id} className={isSelf ? "admin-row-self" : ""}>
-                    <td className="admin-cell-name">
-                      <span className="admin-user-dot" style={{ background: user.cursorColor }} />
-                      {user.pseudo || "—"}
-                    </td>
-                    <td>{user.firstName || "—"}</td>
-                    <td>{user.lastName || "—"}</td>
-                    <td className="admin-cell-email">{user.email}</td>
-                    <td>
-                      <span className="admin-color-chip" style={{ background: user.cursorColor }} />
-                    </td>
-                    <td>
-                      <span className={`admin-role-badge ${user.role === "admin" ? "admin-role-admin" : "admin-role-user"}`}>
-                        {user.role === "admin" ? "Admin" : "Utilisateur"}
-                      </span>
-                    </td>
-                    <td className="admin-cell-date">
-                      {user.createdAt ? new Date(user.createdAt).toLocaleDateString("fr-FR") : "—"}
-                    </td>
-                    <td>
-                      {isSelf ? (
-                        <span className="admin-you-tag">Vous</span>
-                      ) : (
-                        <button
-                          className={user.role === "admin" ? "outline-btn admin-demote-btn" : "primary-btn admin-promote-btn"}
-                          onClick={() => onToggleRole(user.email, user.role === "admin" ? "user" : "admin")}
-                          disabled={adminLoading}
-                        >
-                          {user.role === "admin" ? "Retirer admin" : "Promouvoir admin"}
-                        </button>
-                      )}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+      {filteredUsers.length === 0 && adminUsers.length > 0 && (
+        <div className="admin-empty">
+          <p>Aucun resultat pour cette recherche.</p>
         </div>
       )}
-    </section>
+
+      {filteredUsers.length > 0 && (
+        <section className="admin-users-grid">
+          {filteredUsers.map((user) => {
+            const isSelf = user.email === currentAccount.email;
+            const isOnline = user.email === currentAccount.email || collaborators.some((c) => {
+              const peerName = (c.name || "").toLowerCase();
+              const userPseudo = (user.pseudo || "").toLowerCase();
+              const userFirst = (user.firstName || "").toLowerCase();
+              return peerName === userPseudo || peerName === userFirst || peerName === user.email.toLowerCase();
+            });
+            const roleBadgeClass = user.role === "founder" ? "admin-role-founder" : user.role === "admin" ? "admin-role-admin" : "admin-role-user";
+            const roleLabel = user.role === "founder" ? "Fondateur" : user.role === "admin" ? "Admin" : "Utilisateur";
+            const createdDate = user.createdAt ? new Date(user.createdAt).toLocaleDateString("fr-FR", { day: "numeric", month: "long", year: "numeric" }) : "—";
+
+            return (
+              <div key={user.id} className={`admin-user-card ${isSelf ? "admin-user-card-self" : ""}`}>
+                <div className="admin-user-card-top">
+                  <div className="admin-user-avatar" style={{ borderColor: user.cursorColor }}>
+                    <span className="admin-user-avatar-letter" style={{ color: user.cursorColor }}>
+                      {(user.pseudo || user.firstName || user.email).charAt(0).toUpperCase()}
+                    </span>
+                    {isOnline && <span className="admin-user-online-dot" />}
+                  </div>
+                  <div className="admin-user-identity">
+                    <strong className="admin-user-pseudo">
+                      {user.pseudo || "Sans pseudo"}
+                      {isSelf && <span className="admin-user-you-chip">vous</span>}
+                    </strong>
+                    <span className="admin-user-fullname">{user.firstName} {user.lastName}</span>
+                  </div>
+                  <span className={`admin-role-badge ${roleBadgeClass}`}>{roleLabel}</span>
+                </div>
+                <div className="admin-user-card-details">
+                  <div className="admin-user-detail-row">
+                    <span className="admin-user-detail-icon">📧</span>
+                    <span className="admin-user-detail-value">{user.email}</span>
+                  </div>
+                  <div className="admin-user-detail-row">
+                    <span className="admin-user-detail-icon">📅</span>
+                    <span className="admin-user-detail-value">Inscrit le {createdDate}</span>
+                  </div>
+                  <div className="admin-user-detail-row">
+                    <span className="admin-user-detail-icon">🎨</span>
+                    <span className="admin-user-detail-value" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      Couleur
+                      <span className="admin-color-chip" style={{ background: user.cursorColor }} />
+                    </span>
+                  </div>
+                  <div className="admin-user-detail-row">
+                    <span className="admin-user-detail-icon">{isOnline ? "🟢" : "⚫"}</span>
+                    <span className="admin-user-detail-value">{isOnline ? "En ligne" : "Hors ligne"}</span>
+                  </div>
+                </div>
+                <div className="admin-user-card-actions" style={{ display: "flex", gap: 8 }}>
+                  {isFounder && !isSelf && user.role !== "founder" && (
+                    <button
+                      className={user.role === "admin" ? "outline-btn admin-demote-btn" : "primary-btn admin-promote-btn"}
+                      onClick={() => onToggleRole(user.email, user.role === "admin" ? "user" : "admin")}
+                      disabled={adminLoading}
+                    >
+                      {user.role === "admin" ? "Retirer admin" : "Promouvoir admin"}
+                    </button>
+                  )}
+                  {user.role === "user" && (
+                    <button
+                      className="outline-btn admin-perms-btn"
+                      onClick={() => handleOpenPermissions(user)}
+                      disabled={adminLoading}
+                    >
+                      Autorisation
+                    </button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </section>
+      )}
+    </div>
   );
 }
 
@@ -4085,6 +6828,17 @@ function shouldHandleGlobalHistoryShortcut(target: EventTarget | null) {
 function App() {
   const [page, setPage] = useState<PageKey>(getInitialPage);
   const [currentAccount, setCurrentAccount] = useState<AccountProfile | null>(loadStoredSessionAccount);
+
+  const visiblePageKeys = useMemo(
+    () =>
+      currentAccount
+        ? pageKeys.filter((pageKey) => canAccessPage(currentAccount, pageKey))
+        : [],
+    [currentAccount]
+  );
+
+  
+
   const [authMode, setAuthMode] = useState<AuthMode>("signin");
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState("");
@@ -4140,6 +6894,7 @@ function App() {
   });
   const [subPanelOpen, setSubPanelOpen] = useState(false);
   const [subDeletePanelOpen, setSubDeletePanelOpen] = useState(false);
+  const [dashboardUnexpectedModalOpen, setDashboardUnexpectedModalOpen] = useState(false);
   const [subFormLabel, setSubFormLabel] = useState("");
   const [subFormAmount, setSubFormAmount] = useState("");
   const [subFormError, setSubFormError] = useState("");
@@ -4147,18 +6902,38 @@ function App() {
   const [loadingTickets, setLoadingTickets] = useState(true);
   const [refreshingTickets, setRefreshingTickets] = useState(false);
   const [ticketsError, setTicketsError] = useState("");
-  const [lastTicketsSyncLabel, setLastTicketsSyncLabel] = useState("");
+  const [lastTicketsSyncAt, setLastTicketsSyncAt] = useState<number | null>(null);
   const [selectedMonth, setSelectedMonth] = useState(getCurrentMonthValue);
+  const [auditReferenceMonth, setAuditReferenceMonth] = useState(() =>
+    getRelativeMonthValue(getCurrentMonthValue(), -1)
+  );
+  const [auditReloadSeed, setAuditReloadSeed] = useState(0);
+  const [comparePrimaryMonth, setComparePrimaryMonth] = useState(selectedMonth);
+  const [compareSecondaryMonth, setCompareSecondaryMonth] = useState(() =>
+    getRelativeMonthValue(selectedMonth, -1)
+  );
+  const [compareSortMode, setCompareSortMode] = useState<CompareSortMode>("delta");
+  const [compareReloadSeed, setCompareReloadSeed] = useState(0);
+  const [compareMonthStates, setCompareMonthStates] = useState<
+    Record<string, CompareMonthState>
+  >({});
   const [ticketSearch, setTicketSearch] = useState("");
   const [ticketCategoryFilter, setTicketCategoryFilter] = useState("all");
   const [ticketStatusFilter, setTicketStatusFilter] = useState<TicketStatusFilter>("all");
   const [ticketSortMode, setTicketSortMode] = useState<TicketSortMode>("date_desc");
   const [reloadSeed, setReloadSeed] = useState(0);
   const [isTicketModalOpen, setIsTicketModalOpen] = useState(false);
+  const [ticketsSheetModalOpen, setTicketsSheetModalOpen] = useState(false);
   const [budgetDetailsOpen, setBudgetDetailsOpen] = useState(false);
   const [budgetPreviewTicket, setBudgetPreviewTicket] = useState<Ticket | null>(null);
   const [submittingTicket, setSubmittingTicket] = useState(false);
   const [submitTicketError, setSubmitTicketError] = useState("");
+  const [ticketCategoryPromptOpen, setTicketCategoryPromptOpen] = useState(false);
+  const [ticketFollowUpPrompt, setTicketFollowUpPrompt] = useState<TicketFollowUpPrompt | null>(null);
+  const [editingTicket, setEditingTicket] = useState<Ticket | null>(null);
+  const [editTicketForm, setEditTicketForm] = useState({ date: "", description: "", category: "", amount: "" });
+  const [editTicketSaving, setEditTicketSaving] = useState(false);
+  const [editTicketError, setEditTicketError] = useState("");
   const [reimbursementForm, setReimbursementForm] = useState<ReimbursementFormLine>(
     createEmptyReimbursementLine
   );
@@ -4187,6 +6962,10 @@ function App() {
   const [adminUsers, setAdminUsers] = useState<AccountProfile[]>([]);
   const [adminLoading, setAdminLoading] = useState(false);
   const [adminError, setAdminError] = useState("");
+  const [adminSearch, setAdminSearch] = useState("");
+  const [adminRoleFilter, setAdminRoleFilter] = useState<"all" | "founder" | "admin" | "user">("all");
+  const [permissionsModalUser, setPermissionsModalUser] = useState<AccountProfile | null>(null);
+  const [permissionsDraft, setPermissionsDraft] = useState<AccountPagePermissions | null>(null);
   const [collabConnectionState, setCollabConnectionState] = useState<
     "connecting" | "live" | "unstable"
   >("connecting");
@@ -4202,8 +6981,10 @@ function App() {
     date: new Date().toISOString().slice(0, 10),
     amount: "",
     description: "",
-    category: categoryOptions[0],
+    category: "",
   });
+  const newTicketFormRef = useRef(newTicketForm);
+  const ticketFollowUpPromptRef = useRef<TicketFollowUpPrompt | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const shouldRestartRecognitionRef = useRef(false);
   const voiceStepRef = useRef<VoiceStep>("date");
@@ -4213,6 +6994,11 @@ function App() {
   const selectedMonthRef = useRef(selectedMonth);
   const ticketsRef = useRef<Ticket[]>([]);
   const lastLoadedMonthRef = useRef("");
+  const monthDataCacheRef = useRef<Record<string, MonthDataCacheEntry>>({});
+  const lastTicketReloadSeedRef = useRef<number | null>(null);
+  const lastCompareReloadSeedRef = useRef<number | null>(null);
+  const lastAuditReloadSeedRef = useRef<number | null>(null);
+  const lastPassiveRefreshAtRef = useRef(0);
   const collabNoteTimestampRef = useRef(0);
   const sharedNoteRef = useRef(sharedNote);
   const collabPointerStateRef = useRef<PointerState>({
@@ -4241,7 +7027,6 @@ function App() {
     page === "collab"
       ? []
       : collaborators.filter((peer) => peer.insideBoard && peer.page === page);
-  const ticketCategoryChoices = getTicketCategoryChoices(tickets);
   const visibleTickets = filterAndSortTickets(
     tickets,
     deferredTicketSearch,
@@ -4249,6 +7034,24 @@ function App() {
     ticketStatusFilter,
     ticketSortMode
   );
+  const comparePrimaryState =
+    compareMonthStates[comparePrimaryMonth] ?? createEmptyCompareMonthState();
+  const compareSecondaryState =
+    compareMonthStates[compareSecondaryMonth] ?? createEmptyCompareMonthState();
+  const auditReferenceState =
+    compareMonthStates[auditReferenceMonth] ?? createEmptyCompareMonthState();
+  const updateNewTicketForm = (
+    update: NewTicketForm | ((current: NewTicketForm) => NewTicketForm)
+  ) => {
+    setNewTicketForm((current) => {
+      const next =
+        typeof update === "function"
+          ? (update as (current: NewTicketForm) => NewTicketForm)(current)
+          : update;
+      newTicketFormRef.current = next;
+      return next;
+    });
+  };
   const updateAvailable = Boolean(availableUpdate);
   const updateBannerDateLabel =
     updateAvailable && availableUpdate?.pubDate
@@ -4267,6 +7070,14 @@ function App() {
   useEffect(() => {
     voiceStepRef.current = voiceStep;
   }, [voiceStep]);
+
+  useEffect(() => {
+    newTicketFormRef.current = newTicketForm;
+  }, [newTicketForm]);
+
+  useEffect(() => {
+    ticketFollowUpPromptRef.current = ticketFollowUpPrompt;
+  }, [ticketFollowUpPrompt]);
 
   useEffect(() => {
     ticketsRef.current = tickets;
@@ -4340,6 +7151,32 @@ function App() {
   useEffect(() => {
     selectedMonthRef.current = selectedMonth;
   }, [selectedMonth]);
+
+  useEffect(() => {
+    setDashboardUnexpectedModalOpen(false);
+  }, [selectedMonth, page]);
+
+  useEffect(() => {
+    setTicketsSheetModalOpen(false);
+  }, [selectedMonth, page]);
+
+  useEffect(() => {
+    if (auditReferenceMonth === selectedMonth) {
+      setAuditReferenceMonth(getRelativeMonthValue(selectedMonth, -1));
+    }
+  }, [selectedMonth, auditReferenceMonth]);
+
+  useEffect(() => {
+    if (currentAccount) {
+      return;
+    }
+
+    monthDataCacheRef.current = {};
+    lastTicketReloadSeedRef.current = null;
+    lastCompareReloadSeedRef.current = null;
+    lastAuditReloadSeedRef.current = null;
+    lastPassiveRefreshAtRef.current = 0;
+  }, [currentAccount]);
 
   useEffect(() => {
     setBudgetPreviewTicket(null);
@@ -4485,7 +7322,6 @@ function App() {
           title: "Retour arriere refuse",
           detail: message,
         });
-        return;
       }
     }
 
@@ -4602,6 +7438,76 @@ function App() {
     historyState.past.length > 0 || reimbursementUndoActionRef.current !== null;
   const canRedo =
     historyState.future.length > 0 || reimbursementRedoActionRef.current !== null;
+
+  const pageLabels: Record<keyof AccountPagePermissions, string> = {
+    dashboard: "Dashboard",
+    tickets: "Tickets",
+    annual: "Annuel",
+    audits: "Audits",
+    compare: "Comparateur",
+    subscriptions: "Abonnements",
+    collab: "Collab",
+    settings: "Paramètres",
+    version: "Version",
+    admin: "Admin panel",
+  };
+
+  const handleOpenPermissions = (user: AccountProfile) => {
+    setPermissionsModalUser(user);
+    setPermissionsDraft(getEditablePermissions(user));
+  };
+
+  const handleClosePermissions = () => {
+    setPermissionsModalUser(null);
+    setPermissionsDraft(null);
+  };
+
+  const handleTogglePermission = (key: keyof AccountPagePermissions) => {
+    if (!permissionsDraft) return;
+    setPermissionsDraft({ ...permissionsDraft, [key]: !permissionsDraft[key] });
+  };
+
+  const permissionsModal = permissionsModalUser && permissionsDraft && (
+    <div className="admin-perms-modal-backdrop" onClick={handleClosePermissions}>
+      <div className="admin-perms-modal" onClick={(e) => e.stopPropagation()}>
+        <h2>Autorisation d'accès</h2>
+        <div className="admin-perms-user-summary">
+          <span
+            className="admin-user-avatar-letter"
+            style={{ color: permissionsModalUser.cursorColor }}
+          >
+            {(permissionsModalUser.pseudo || permissionsModalUser.firstName || permissionsModalUser.email)
+              .charAt(0)
+              .toUpperCase()}
+          </span>
+          <div>
+            <strong>{permissionsModalUser.pseudo || permissionsModalUser.email}</strong>
+            <div style={{ fontSize: 13, color: "#888" }}>{permissionsModalUser.email}</div>
+          </div>
+        </div>
+        <div style={{ marginTop: 24 }}>
+          <div className="admin-perms-list">
+            {(Object.keys(permissionsDraft) as (keyof AccountPagePermissions)[]).map((key) => (
+              <button
+                key={key}
+                type="button"
+                className={`admin-perms-row ${permissionsDraft[key] ? "enabled" : "disabled"}`}
+                onClick={() => handleTogglePermission(key)}
+              >
+                <span>{pageLabels[key]}</span>
+                <strong>{permissionsDraft[key] ? "Oui" : "Non"}</strong>
+              </button>
+            ))}
+          </div>
+        </div>
+        <div style={{ marginTop: 20, display: "flex", justifyContent: "flex-end", gap: 10 }}>
+          <button type="button" className="ghost-btn" onClick={handleClosePermissions}>
+            Fermer
+          </button>
+        </div>
+      </div>
+    </div>
+  );
 
    useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -5121,6 +8027,22 @@ function App() {
       window.localStorage.setItem(dashboardSubscriptionsStorageKey, JSON.stringify(subs));
     });
 
+    channel.on("broadcast", { event: "role-update" }, ({ payload }) => {
+      if (!payload || typeof payload !== "object") return;
+      const row = payload as Record<string, unknown>;
+      const targetEmail = String(row.targetEmail ?? "");
+      const newRole = String(row.newRole ?? "");
+      if (!targetEmail || !newRole) return;
+
+      setCurrentAccount((prev) => {
+        if (!prev || prev.email !== targetEmail) return prev;
+        const updatedRole = targetEmail === FOUNDER_EMAIL ? "founder" as const : newRole === "admin" ? "admin" as const : "user" as const;
+        const updated = { ...prev, role: updatedRole };
+        persistSessionAccount(updated);
+        return updated;
+      });
+    });
+
     channel.subscribe((status) => {
       if (!active) {
         return;
@@ -5203,23 +8125,37 @@ function App() {
       if (!currentAccount) {
         setTickets([]);
         setTicketMonthSummary(null);
-        setReimbursementDetails({
-          entries: [],
-          ceTotal: 0,
-          medecinTotal: 0,
-          total: 0,
-        });
+        setReimbursementDetails(createEmptyReimbursementDetails());
+        setLastTicketsSyncAt(null);
         setLoadingTickets(false);
         setRefreshingTickets(false);
         return;
       }
 
-      const hasVisibleTickets = ticketsRef.current.length > 0;
-      const keepCurrentView =
-        hasVisibleTickets && lastLoadedMonthRef.current === selectedMonth;
+      const cachedMonth = monthDataCacheRef.current[selectedMonth];
+      const reloadRequested = lastTicketReloadSeedRef.current !== reloadSeed;
+
+      if (cachedMonth) {
+        setTickets(cachedMonth.tickets);
+        setTicketMonthSummary(cachedMonth.summary);
+        setReimbursementDetails(cachedMonth.reimbursements);
+        setLastTicketsSyncAt(cachedMonth.syncedAt);
+        lastLoadedMonthRef.current = selectedMonth;
+      } else {
+        setLastTicketsSyncAt(null);
+      }
+
+      if (cachedMonth && !reloadRequested) {
+        setLoadingTickets(false);
+        setRefreshingTickets(false);
+        setTicketsError("");
+        return;
+      }
 
       try {
-        if (!keepCurrentView) {
+        lastTicketReloadSeedRef.current = reloadSeed;
+
+        if (!cachedMonth) {
           setLoadingTickets(true);
         } else {
           setRefreshingTickets(true);
@@ -5227,42 +8163,29 @@ function App() {
         setTicketsError("");
 
         const data = await fetchTicketsFromSheets(selectedMonth);
-        const normalized = normalizeTickets(data);
-        const normalizedSummary = normalizeTicketMonthSummary(data);
-        const normalizedReimbursements = normalizeReimbursementDetails(data);
-        setTickets(normalized);
-        setTicketMonthSummary(
-          normalizedSummary ?? {
-            accountBalance: null,
-            currentRemaining: ticketsFinancePreset.monthlyIncome - normalized.reduce((sum, ticket) => sum + ticket.amount, 0),
-            theoreticalRemaining:
-              ticketsFinancePreset.monthlyIncome -
-              computeTicketBudgetLines(normalized).reduce((sum, line) => sum + line.planned, 0),
-            unexpectedSpendTotal: null,
-            source: "fallback",
-          }
-        );
-        setReimbursementDetails(normalizedReimbursements);
+        const normalized = normalizeMonthDataPayload(data);
+        const syncedAt = Date.now();
+
+        monthDataCacheRef.current[selectedMonth] = {
+          tickets: normalized.tickets,
+          summary: normalized.summary,
+          reimbursements: normalized.reimbursements,
+          syncedAt,
+        };
+
+        setTickets(normalized.tickets);
+        setTicketMonthSummary(normalized.summary);
+        setReimbursementDetails(normalized.reimbursements);
         lastLoadedMonthRef.current = selectedMonth;
-        setLastTicketsSyncLabel(
-          new Date().toLocaleTimeString("fr-FR", {
-            hour: "2-digit",
-            minute: "2-digit",
-            second: "2-digit",
-          })
-        );
+        setLastTicketsSyncAt(syncedAt);
       } catch (error) {
         console.error("Chargement Google Sheets impossible:", error);
         setTicketsError(getErrorMessage(error));
-        if (!keepCurrentView) {
+        if (!cachedMonth) {
           setTickets([]);
           setTicketMonthSummary(null);
-          setReimbursementDetails({
-            entries: [],
-            ceTotal: 0,
-            medecinTotal: 0,
-            total: 0,
-          });
+          setReimbursementDetails(createEmptyReimbursementDetails());
+          setLastTicketsSyncAt(null);
         }
       } finally {
         setLoadingTickets(false);
@@ -5272,6 +8195,207 @@ function App() {
 
     loadTickets();
   }, [currentAccount, selectedMonth, reloadSeed]);
+
+  useEffect(() => {
+    if (page !== "compare") {
+      return;
+    }
+
+    if (!currentAccount) {
+      setCompareMonthStates({});
+      return;
+    }
+
+    let cancelled = false;
+    const monthsToLoad = [...new Set([comparePrimaryMonth, compareSecondaryMonth])];
+    const reloadRequested = lastCompareReloadSeedRef.current !== compareReloadSeed;
+    lastCompareReloadSeedRef.current = compareReloadSeed;
+
+    monthsToLoad.forEach((month) => {
+      const cachedMonth = monthDataCacheRef.current[month];
+
+      if (cachedMonth) {
+        setCompareMonthStates((prev) => ({
+          ...prev,
+          [month]: {
+            tickets: cachedMonth.tickets,
+            summary: cachedMonth.summary,
+            loading: false,
+            error: "",
+            syncedAt: cachedMonth.syncedAt,
+          },
+        }));
+      }
+
+      if (cachedMonth && !reloadRequested) {
+        return;
+      }
+
+      setCompareMonthStates((prev) => ({
+        ...prev,
+        [month]: {
+          ...createEmptyCompareMonthState(),
+          ...(prev[month] ?? {}),
+          loading: !cachedMonth,
+          error: "",
+        },
+      }));
+
+      void fetchTicketsFromSheets(month)
+        .then((data) => {
+          const normalized = normalizeMonthDataPayload(data);
+          const syncedAt = Date.now();
+
+          monthDataCacheRef.current[month] = {
+            tickets: normalized.tickets,
+            summary: normalized.summary,
+            reimbursements: normalized.reimbursements,
+            syncedAt,
+          };
+
+          if (cancelled) {
+            return;
+          }
+
+          setCompareMonthStates((prev) => ({
+            ...prev,
+            [month]: {
+              tickets: normalized.tickets,
+              summary: normalized.summary,
+              loading: false,
+              error: "",
+              syncedAt,
+            },
+          }));
+        })
+        .catch((error) => {
+          if (cancelled) {
+            return;
+          }
+
+          setCompareMonthStates((prev) => ({
+            ...prev,
+            [month]: {
+              ...createEmptyCompareMonthState(),
+              ...(prev[month] ?? {}),
+              loading: false,
+              error: getErrorMessage(error),
+              syncedAt: Date.now(),
+            },
+          }));
+        });
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    page,
+    currentAccount,
+    comparePrimaryMonth,
+    compareSecondaryMonth,
+    compareReloadSeed,
+  ]);
+
+  useEffect(() => {
+    if (page !== "audits") {
+      return;
+    }
+
+    if (!currentAccount) {
+      return;
+    }
+
+    if (auditReferenceMonth === selectedMonth) {
+      return;
+    }
+
+    let cancelled = false;
+    const cachedMonth = monthDataCacheRef.current[auditReferenceMonth];
+    const reloadRequested = lastAuditReloadSeedRef.current !== auditReloadSeed;
+    lastAuditReloadSeedRef.current = auditReloadSeed;
+
+    if (cachedMonth) {
+      setCompareMonthStates((prev) => ({
+        ...prev,
+        [auditReferenceMonth]: {
+          tickets: cachedMonth.tickets,
+          summary: cachedMonth.summary,
+          loading: false,
+          error: "",
+          syncedAt: cachedMonth.syncedAt,
+        },
+      }));
+    }
+
+    if (cachedMonth && !reloadRequested) {
+      return;
+    }
+
+    setCompareMonthStates((prev) => ({
+      ...prev,
+      [auditReferenceMonth]: {
+        ...createEmptyCompareMonthState(),
+        ...(prev[auditReferenceMonth] ?? {}),
+        loading: !cachedMonth,
+        error: "",
+      },
+    }));
+
+    void fetchTicketsFromSheets(auditReferenceMonth)
+      .then((data) => {
+        const normalized = normalizeMonthDataPayload(data);
+        const syncedAt = Date.now();
+
+        monthDataCacheRef.current[auditReferenceMonth] = {
+          tickets: normalized.tickets,
+          summary: normalized.summary,
+          reimbursements: normalized.reimbursements,
+          syncedAt,
+        };
+
+        if (cancelled) {
+          return;
+        }
+
+        setCompareMonthStates((prev) => ({
+          ...prev,
+          [auditReferenceMonth]: {
+            tickets: normalized.tickets,
+            summary: normalized.summary,
+            loading: false,
+            error: "",
+            syncedAt,
+          },
+        }));
+      })
+      .catch((loadError) => {
+        if (cancelled) {
+          return;
+        }
+
+        setCompareMonthStates((prev) => ({
+          ...prev,
+          [auditReferenceMonth]: {
+            ...createEmptyCompareMonthState(),
+            ...(prev[auditReferenceMonth] ?? {}),
+            loading: false,
+            error: getErrorMessage(loadError),
+            syncedAt: Date.now(),
+          },
+        }));
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    page,
+    currentAccount,
+    auditReferenceMonth,
+    selectedMonth,
+    auditReloadSeed,
+  ]);
 
   useEffect(() => {
     collabChannelRef.current?.postMessage({
@@ -5296,6 +8420,12 @@ function App() {
 
     const triggerRefresh = () => {
       if (document.visibilityState === "visible") {
+        const now = Date.now();
+        if (now - lastPassiveRefreshAtRef.current < 90_000) {
+          return;
+        }
+
+        lastPassiveRefreshAtRef.current = now;
         setReloadSeed((value) => value + 1);
       }
     };
@@ -5310,7 +8440,7 @@ function App() {
       if (pageRef.current === "dashboard" || pageRef.current === "tickets") {
         triggerRefresh();
       }
-    }, 45000);
+    }, 120000);
 
     window.addEventListener("focus", triggerRefresh);
     document.addEventListener("visibilitychange", handleVisibilityChange);
@@ -5420,16 +8550,18 @@ function App() {
 
   const handleOpenTicketModal = () => {
     setSubmitTicketError("");
-    setNewTicketForm((current) => ({
+    setTicketCategoryPromptOpen(false);
+    setTicketFollowUpPrompt(null);
+    updateNewTicketForm((current) => ({
       ...current,
       date: current.date || new Date().toISOString().slice(0, 10),
       description: "",
       amount: "",
-      category: categoryOptions[0],
+      category: "",
     }));
     setVoiceTranscript("");
     setVoiceStep("date");
-    setVoiceFeedback("Pret. Clique sur la dictee et reponds a la premiere question.");
+    setVoiceFeedback("");
     setIsTicketModalOpen(true);
   };
 
@@ -5442,14 +8574,51 @@ function App() {
     setSubmitTicketError("");
     setVoiceFeedback("");
     setVoiceTranscript("");
-    shouldRestartRecognitionRef.current = false;
-    recognitionRef.current?.stop();
-    setVoiceListening(false);
+    setTicketCategoryPromptOpen(false);
+    setTicketFollowUpPrompt(null);
+    stopTicketVoiceSession();
     setVoiceStep("date");
   };
 
   const handleRefreshTickets = () => {
     setReloadSeed((value) => value + 1);
+  };
+
+  const handleAuditReferenceMonthChange = (month: string) => {
+    if (month === selectedMonth) {
+      return;
+    }
+
+    setAuditReferenceMonth(month);
+  };
+
+  const handleRefreshAudits = () => {
+    setReloadSeed((value) => value + 1);
+    setAuditReloadSeed((value) => value + 1);
+  };
+
+  const handleComparePrimaryMonthChange = (month: string) => {
+    setComparePrimaryMonth(month);
+  };
+
+  const handleCompareSecondaryMonthChange = (month: string) => {
+    setCompareSecondaryMonth(month);
+  };
+
+  const handleSwapCompareMonths = () => {
+    setComparePrimaryMonth(compareSecondaryMonth);
+    setCompareSecondaryMonth(comparePrimaryMonth);
+  };
+
+  const handleSyncCompareWithSelectedMonth = () => {
+    setComparePrimaryMonth(selectedMonth);
+    if (selectedMonth === compareSecondaryMonth) {
+      setCompareSecondaryMonth(getRelativeMonthValue(selectedMonth, -1));
+    }
+  };
+
+  const handleRefreshCompare = () => {
+    setCompareReloadSeed((value) => value + 1);
   };
 
   const changePageWithHistory = (nextPage: PageKey) => {
@@ -5536,33 +8705,151 @@ function App() {
     handleSharedNoteChange(value);
   };
 
-  const handleSubmitTicket = async () => {
-    if (!newTicketForm.date || !newTicketForm.amount || !newTicketForm.description.trim()) {
+  const stopTicketVoiceSession = () => {
+    shouldRestartRecognitionRef.current = false;
+    recognitionRef.current?.stop();
+    setVoiceListening(false);
+  };
+
+  const promptManualTicketCategory = (fromVoice = false) => {
+    setTicketCategoryPromptOpen(true);
+    setSubmitTicketError("");
+    if (fromVoice) {
+      setVoiceFeedback("Je n ai pas trouve la categorie. Choisis-la dans le menu deroulant puis dis valider.");
+    }
+  };
+
+  const handleNewTicketFormChange = (patch: Partial<NewTicketForm>) => {
+    updateNewTicketForm((current) => ({ ...current, ...patch }));
+
+    if ("category" in patch) {
+      const category = String(patch.category || "").trim();
+      if (category) {
+        setTicketCategoryPromptOpen(false);
+        setSubmitTicketError("");
+        if (voiceStepRef.current === "confirm") {
+          setVoiceFeedback("Categorie choisie. Dis maintenant valider, modifier ou annuler.");
+        }
+      }
+    }
+  };
+
+  const handleSubmitTicket = async (
+    formOverride?: NewTicketForm,
+    options?: { viaVoice?: boolean }
+  ) => {
+    const sourceForm = formOverride ?? newTicketFormRef.current;
+    const normalizedForm: NewTicketForm = {
+      ...sourceForm,
+      date: (sourceForm.date || "").trim(),
+      amount: (sourceForm.amount || "").trim(),
+      description: (sourceForm.description || "").trim(),
+      category: (sourceForm.category || inferCategoryFromDescription(sourceForm.description || "") || "").trim(),
+    };
+
+    if (!normalizedForm.date || !normalizedForm.amount || !normalizedForm.description) {
       setSubmitTicketError("Date, montant et description sont obligatoires.");
+      return;
+    }
+
+    if (!normalizedForm.category) {
+      promptManualTicketCategory(Boolean(options?.viaVoice));
       return;
     }
 
     try {
       setSubmittingTicket(true);
       setSubmitTicketError("");
+      setTicketCategoryPromptOpen(false);
       setVoiceFeedback("");
-      shouldRestartRecognitionRef.current = false;
-      recognitionRef.current?.stop();
-      setVoiceListening(false);
+      stopTicketVoiceSession();
 
-      const response = await createTicketInSheets(selectedMonth, newTicketForm);
+      const response = await createTicketInSheets(selectedMonth, normalizedForm);
       const responseObject = response as { success?: boolean; error?: string };
 
       if (responseObject?.success === false) {
         throw new Error(responseObject.error || "Ajout du ticket refuse par Google Sheets.");
       }
 
-      setIsTicketModalOpen(false);
       setReloadSeed((value) => value + 1);
+      setTicketFollowUpPrompt({
+        keepDate: normalizedForm.date,
+        voiceEnabled: Boolean(options?.viaVoice),
+      });
+      setVoiceTranscript("");
+      if (options?.viaVoice) {
+        window.setTimeout(() => {
+          startTicketVoiceSession(getAnotherTicketVoicePrompt());
+        }, 180);
+      }
     } catch (error) {
       setSubmitTicketError(getErrorMessage(error));
     } finally {
       setSubmittingTicket(false);
+    }
+  };
+
+  const handleStartEditTicket = (ticket: Ticket) => {
+    const dateParts = (ticket.date || "").split("/");
+    const isoDate = dateParts.length === 3 ? `${dateParts[2]}-${dateParts[1]}-${dateParts[0]}` : "";
+    setEditingTicket(ticket);
+    setEditTicketForm({
+      date: isoDate,
+      description: ticket.description,
+      category: ticket.category,
+      amount: String(ticket.amount),
+    });
+    setEditTicketError("");
+  };
+
+  const handleCancelEditTicket = () => {
+    setEditingTicket(null);
+    setEditTicketForm({ date: "", description: "", category: "", amount: "" });
+    setEditTicketError("");
+  };
+
+  const handleSaveEditTicket = async () => {
+    if (!editingTicket) return;
+    if (!editTicketForm.date || !editTicketForm.amount || !editTicketForm.description.trim()) {
+      setEditTicketError("Date, montant et description sont obligatoires.");
+      return;
+    }
+    if (!Number.isFinite(editingTicket.sheetRow) || !Number.isFinite(editingTicket.blockIndex)) {
+      setEditTicketError("Impossible de localiser ce ticket dans le sheet.");
+      return;
+    }
+
+    try {
+      setEditTicketSaving(true);
+      setEditTicketError("");
+
+      const response = await updateTicketInSheets(
+        selectedMonth,
+        editingTicket.sheetRow!,
+        editingTicket.blockIndex!,
+        editTicketForm
+      );
+      const responseObject = response as { success?: boolean; error?: string };
+
+      if (responseObject?.success === false) {
+        throw new Error(responseObject.error || "Modification refusee par Google Sheets.");
+      }
+
+      pushHistoryEvent({
+        tone: "ok",
+        source: "app",
+        title: "Ticket modifie",
+        detail: `"${editTicketForm.description}" — ${Number(editTicketForm.amount).toFixed(2)} €`,
+        shortcut: null,
+      });
+
+      setEditingTicket(null);
+      setEditTicketForm({ date: "", description: "", category: "", amount: "" });
+      setReloadSeed((value) => value + 1);
+    } catch (error) {
+      setEditTicketError(getErrorMessage(error));
+    } finally {
+      setEditTicketSaving(false);
     }
   };
 
@@ -5745,12 +9032,15 @@ function App() {
   };
 
   const handleLoadAdminUsers = async () => {
-    if (!currentAccount || currentAccount.role !== "admin") return;
+    if (!currentAccount || !isPrivileged(currentAccount)) return;
     setAdminLoading(true);
     setAdminError("");
     try {
       const users = await fetchAllUsersFromSheets(currentAccount.email, currentAccount.sessionToken);
-      setAdminUsers(users);
+      const usersWithFounder = users.map((u) => u.email === FOUNDER_EMAIL ? { ...u, role: "founder" as const } : u);
+      console.log("ADMIN USERS RAW:", users);
+      console.log("ADMIN USERS NORMALIZED:", usersWithFounder);
+      setAdminUsers(usersWithFounder);
     } catch (err) {
       setAdminError(getErrorMessage(err));
     } finally {
@@ -5759,7 +9049,8 @@ function App() {
   };
 
   const handleToggleUserRole = async (targetEmail: string, newRole: "admin" | "user") => {
-    if (!currentAccount || currentAccount.role !== "admin") return;
+    if (!currentAccount || currentAccount.role !== "founder") return;
+    if (targetEmail === FOUNDER_EMAIL) return;
     setAdminLoading(true);
     setAdminError("");
     try {
@@ -5770,6 +9061,12 @@ function App() {
         newRole
       );
       await handleLoadAdminUsers();
+
+      void supabaseChannelRef.current?.send({
+        type: "broadcast",
+        event: "role-update",
+        payload: { targetEmail, newRole },
+      });
     } catch (err) {
       setAdminError(getErrorMessage(err));
       setAdminLoading(false);
@@ -5777,19 +9074,12 @@ function App() {
   };
 
   useEffect(() => {
-    if (!currentAccount) {
-      return;
-    }
+    if (!currentAccount) return;
+    if (page !== "admin") return;
+    if (!isPrivileged(currentAccount)) return;
 
-    if (page === "admin" && currentAccount.role !== "admin") {
-      setPage("dashboard");
-      return;
-    }
-
-    if (page === "admin" && currentAccount.role === "admin" && !adminLoading && adminUsers.length === 0) {
-      void handleLoadAdminUsers();
-    }
-  }, [page, currentAccount, adminLoading, adminUsers.length]);
+    void handleLoadAdminUsers();
+  }, [page, currentAccount?.email, currentAccount?.sessionToken]);
 
   const handleSaveQuickProfile = async () => {
     if (!currentAccount) return;
@@ -5961,90 +9251,10 @@ function App() {
     }
   };
 
-  const handleVoiceResult = (transcript: string) => {
-    const normalizedCommand = normalizeVoiceCommand(transcript);
-    const currentStep = voiceStepRef.current;
-
-    if (currentStep === "confirm") {
-      if (normalizedCommand.includes("annuler")) {
-        handleCloseTicketModal();
-        return;
-      }
-
-      if (normalizedCommand.includes("recommencer")) {
-        setNewTicketForm((current) => ({
-          ...current,
-          amount: "",
-          description: "",
-          category: categoryOptions[0],
-        }));
-        setVoiceTranscript("");
-        setVoiceFeedback("On repart proprement. Redis la date.");
-        setVoiceStep("date");
-        return;
-      }
-
-      if (normalizedCommand.includes("valider")) {
-        void handleSubmitTicket();
-        return;
-      }
-
-      const detectedCategory = detectVoiceCategory(transcript);
-      if (detectedCategory && detectedCategory !== categoryOptions[9]) {
-        setNewTicketForm((current) => ({ ...current, category: detectedCategory }));
-        setVoiceFeedback(`Categorie ajustee: ${detectedCategory}. Dis maintenant valider, recommencer ou annuler.`);
-        return;
-      }
-
-      setVoiceFeedback("Dis valider, recommencer ou annuler.");
-      return;
-    }
-
-    const patch = applyVoiceStepValue(currentStep, transcript, newTicketForm);
-
-    if (
-      (currentStep === "date" && !patch.date) ||
-      (currentStep === "amount" && !patch.amount) ||
-      (currentStep === "description" && !patch.description)
-    ) {
-      setVoiceFeedback(`Je n ai pas bien compris la ${getVoiceStepLabel(currentStep).toLowerCase()}. Redis calmement.`);
-      return;
-    }
-
-    setNewTicketForm((current) => ({ ...current, ...applyVoiceStepValue(currentStep, transcript, current) }));
-    setVoiceTranscript(transcript);
-
-    const nextStep = getNextVoiceStep(currentStep);
-    setVoiceStep(nextStep);
-
-    if (currentStep === "date") {
-      setVoiceFeedback("Date comprise. Dis maintenant le montant.");
-      return;
-    }
-
-    if (currentStep === "amount") {
-      setVoiceFeedback("Montant compris. Dis maintenant la description.");
-      return;
-    }
-
-    const detectedCategory = detectVoiceCategory(transcript);
-    setVoiceFeedback(
-      `Description comprise.${detectedCategory ? ` Categorie detectee: ${detectedCategory}.` : ""} Dis valider, recommencer ou annuler.`
-    );
-  };
-
-  const handleToggleVoice = () => {
+  const startTicketVoiceSession = (initialFeedback?: string) => {
     const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!Recognition) {
-      setSubmitTicketError("La dictee vocale n est pas disponible ici.");
-      return;
-    }
-
-    if (voiceListening && recognitionRef.current) {
-      shouldRestartRecognitionRef.current = false;
-      recognitionRef.current.stop();
-      setVoiceListening(false);
-      setVoiceFeedback("Dictée arrêtée.");
+      setSubmitTicketError("La dicter vocale n est pas disponible ici.");
       return;
     }
 
@@ -6078,7 +9288,7 @@ function App() {
     recognition.onerror = () => {
       shouldRestartRecognitionRef.current = false;
       setVoiceListening(false);
-      setVoiceFeedback("La dictee vocale a rencontre un probleme.");
+      setVoiceFeedback("La dicter vocale a rencontre un probleme.");
     };
 
     recognition.onend = () => {
@@ -6098,15 +9308,175 @@ function App() {
     shouldRestartRecognitionRef.current = true;
     setSubmitTicketError("");
     setVoiceListening(true);
-    setVoiceFeedback(getVoiceStepPrompt(voiceStepRef.current, newTicketForm));
+    setVoiceFeedback(
+      initialFeedback ??
+        (ticketFollowUpPromptRef.current
+          ? getAnotherTicketVoicePrompt()
+          : getVoiceStepPrompt(voiceStepRef.current, newTicketFormRef.current))
+    );
 
     try {
       recognition.start();
     } catch {
       shouldRestartRecognitionRef.current = false;
       setVoiceListening(false);
-      setVoiceFeedback("Impossible de lancer la dictee pour le moment.");
+      setVoiceFeedback("Impossible de lancer la dicter pour le moment.");
     }
+  };
+
+  const handleAnotherTicketChoice = (wantsAnotherTicket: boolean) => {
+    const followUpPrompt = ticketFollowUpPromptRef.current;
+
+    if (!wantsAnotherTicket) {
+      handleCloseTicketModal();
+      return;
+    }
+
+    const nextForm: NewTicketForm = {
+      date: followUpPrompt?.keepDate || new Date().toISOString().slice(0, 10),
+      amount: "",
+      description: "",
+      category: "",
+    };
+
+    setTicketFollowUpPrompt(null);
+    setTicketCategoryPromptOpen(false);
+    setSubmitTicketError("");
+    setVoiceTranscript("");
+    setVoiceStep("date");
+    updateNewTicketForm(nextForm);
+    stopTicketVoiceSession();
+
+    if (followUpPrompt?.voiceEnabled) {
+      setVoiceFeedback(getVoiceStepPrompt("date", nextForm));
+      window.setTimeout(() => {
+        startTicketVoiceSession(getVoiceStepPrompt("date", nextForm));
+      }, 180);
+      return;
+    }
+
+    setVoiceFeedback("");
+  };
+
+  const handleVoiceResult = (transcript: string) => {
+    const normalizedCommand = normalizeVoiceCommand(transcript);
+    const currentStep = voiceStepRef.current;
+    const currentForm = newTicketFormRef.current;
+    const followUpPrompt = ticketFollowUpPromptRef.current;
+
+    if (followUpPrompt) {
+      if (hasVoiceKeyword(normalizedCommand, voiceCommandKeywords.yes)) {
+        handleAnotherTicketChoice(true);
+        return;
+      }
+
+      if (hasVoiceKeyword(normalizedCommand, voiceCommandKeywords.no)) {
+        handleAnotherTicketChoice(false);
+        return;
+      }
+
+      setVoiceFeedback("Je n ai pas compris. Dis oui ou non.");
+      return;
+    }
+
+    if (currentStep === "confirm") {
+      if (hasVoiceKeyword(normalizedCommand, voiceCommandKeywords.cancel)) {
+        handleCloseTicketModal();
+        return;
+      }
+
+      if (hasVoiceKeyword(normalizedCommand, voiceCommandKeywords.restart)) {
+        setTicketCategoryPromptOpen(false);
+        updateNewTicketForm((current) => ({
+          ...current,
+          amount: "",
+          description: "",
+          category: "",
+        }));
+        setVoiceTranscript("");
+        setVoiceFeedback("On repart proprement. Redis la date.");
+        setVoiceStep("date");
+        return;
+      }
+
+      if (hasVoiceKeyword(normalizedCommand, voiceCommandKeywords.edit)) {
+        setVoiceTranscript("");
+        setVoiceFeedback("Mode modification. Redis la date, puis le montant, puis la description.");
+        setVoiceStep("date");
+        return;
+      }
+
+      if (hasVoiceKeyword(normalizedCommand, voiceCommandKeywords.confirm)) {
+        void handleSubmitTicket(currentForm, { viaVoice: true });
+        return;
+      }
+
+      const detectedCategory = detectVoiceCategory(transcript);
+      if (detectedCategory) {
+        handleNewTicketFormChange({ category: detectedCategory });
+        return;
+      }
+
+      setVoiceFeedback(
+        currentForm.category
+          ? "Dis valider, modifier ou annuler."
+          : "Choisis une categorie puis dis valider, modifier ou annuler."
+      );
+      return;
+    }
+
+    const patch = applyVoiceStepValue(currentStep, transcript, currentForm);
+
+    if (
+      (currentStep === "date" && !patch.date) ||
+      (currentStep === "amount" && !patch.amount) ||
+      (currentStep === "description" && !patch.description)
+    ) {
+      setVoiceFeedback(`Je n ai pas bien compris la ${getVoiceStepLabel(currentStep).toLowerCase()}. Redis calmement.`);
+      return;
+    }
+
+    handleNewTicketFormChange(patch);
+    setVoiceTranscript(transcript);
+
+    const nextStep = getNextVoiceStep(currentStep);
+    setVoiceStep(nextStep);
+
+    if (currentStep === "date") {
+      setVoiceFeedback("Date comprise. Dis maintenant le montant.");
+      return;
+    }
+
+    if (currentStep === "amount") {
+      setVoiceFeedback("Montant compris. Dis maintenant la description.");
+      return;
+    }
+
+    const nextCategory = String(patch.category || currentForm.category || "").trim();
+    if (!nextCategory) {
+      promptManualTicketCategory(true);
+      setVoiceFeedback("Description comprise. Je n ai pas trouve la categorie. Choisis-la dans le menu deroulant puis dis valider.");
+      return;
+    }
+
+    setVoiceFeedback(`Description comprise. Categorie detectee: ${nextCategory}. Dis valider, modifier ou annuler.`);
+  };
+
+  const handleToggleVoice = () => {
+    if (voiceListening && recognitionRef.current) {
+      stopTicketVoiceSession();
+      setVoiceFeedback("Dictée arrêtée.");
+      return;
+    }
+
+    if (ticketFollowUpPromptRef.current && !ticketFollowUpPromptRef.current.voiceEnabled) {
+      setTicketFollowUpPrompt({
+        ...ticketFollowUpPromptRef.current,
+        voiceEnabled: true,
+      });
+    }
+
+    startTicketVoiceSession();
   };
 
   const handleCollabNameChange = (value: string) => {
@@ -6420,7 +9790,7 @@ function App() {
     { key: "collab", label: "Collab", badge: String(collaborators.length + 1) },
     { key: "settings", label: "Parametres" },
     { key: "version", label: "Version" },
-    ...(currentAccount.role === "admin" ? [{ key: "admin" as PageKey, label: "Admin" }] : []),
+    { key: "admin" as PageKey, label: "Admin" },
   ];
   const mainViewportRect = mainElRef.current?.getBoundingClientRect() ?? null;
 
@@ -6617,6 +9987,7 @@ function App() {
           const onlineCount = onlinePeers.length + 1;
           return (
             <div className="online-badge-wrapper">
+              {refreshingTickets ? <span className="sync-badge">Synchro...</span> : null}
               <button
                 className="online-badge"
                 onClick={() => setShowOnlinePopup((v) => !v)}
@@ -6761,11 +10132,12 @@ function App() {
         {page === "dashboard" &&
           renderDashboard(
             tickets,
+            ticketMonthSummary,
             loadingTickets,
             refreshingTickets,
             ticketsError,
             selectedMonth,
-            lastTicketsSyncLabel,
+            lastTicketsSyncAt,
             reimbursementDetails.total,
             dashboardSubscriptions,
             subPanelOpen,
@@ -6781,11 +10153,15 @@ function App() {
             setSubFormAmount,
             handleAddSubscription,
             handleDeleteSubscription,
-            subDeletePanelOpen
+            subDeletePanelOpen,
+            dashboardUnexpectedModalOpen,
+            () => setDashboardUnexpectedModalOpen(true),
+            () => setDashboardUnexpectedModalOpen(false)
           )}
         {page === "tickets" &&
           renderTickets(
             visibleTickets,
+            tickets,
             ticketMonthSummary,
             tickets.length,
             loadingTickets,
@@ -6801,9 +10177,10 @@ function App() {
             reimbursementStatus,
             reimbursementError,
             selectedMonth,
-            lastTicketsSyncLabel,
+            lastTicketsSyncAt,
+            ticketsSheetModalOpen,
             ticketSearch,
-            ticketCategoryChoices,
+            // ticketCategoryChoices, // REMOVE: not in renderTickets signature
             ticketCategoryFilter,
             ticketStatusFilter,
             ticketSortMode,
@@ -6814,12 +10191,54 @@ function App() {
             handleTicketStatusFilterChange,
             handleTicketSortModeChange,
             handleOpenTicketModal,
+            () => setTicketsSheetModalOpen(true),
+            () => setTicketsSheetModalOpen(false),
             () => setBudgetDetailsOpen(false),
             handleReimbursementFormChangeWithHistory,
             handleSubmitReimbursements,
             handleDeleteReimbursement,
             handleTicketHover,
-            handleTicketLeave
+            handleTicketLeave,
+            editingTicket,
+            editTicketForm,
+            editTicketSaving,
+            editTicketError,
+            handleStartEditTicket,
+            handleCancelEditTicket,
+            (patch: Partial<{ date: string; description: string; category: string; amount: string }>) => setEditTicketForm((prev) => ({ ...prev, ...patch })),
+            handleSaveEditTicket
+          )}
+        {page === "audits" &&
+          renderAudits(
+            tickets,
+            ticketMonthSummary,
+            selectedMonth,
+            auditReferenceMonth,
+            auditReferenceState,
+            loadingTickets,
+            refreshingTickets,
+            ticketsError,
+            lastTicketsSyncAt,
+            dashboardSubscriptions,
+            changeMonthWithHistory,
+            handleAuditReferenceMonthChange,
+            handleRefreshAudits
+          )}
+        {page === "compare" &&
+          renderCompare(
+            comparePrimaryMonth,
+            compareSecondaryMonth,
+            comparePrimaryState,
+            compareSecondaryState,
+            compareSortMode,
+            selectedMonth,
+            dashboardSubscriptions,
+            handleComparePrimaryMonthChange,
+            handleCompareSecondaryMonthChange,
+            handleSwapCompareMonths,
+            handleSyncCompareWithSelectedMonth,
+            handleRefreshCompare,
+            setCompareSortMode
           )}
         {page === "collab" &&
           renderCollab(
@@ -6877,12 +10296,19 @@ function App() {
             adminLoading,
             adminError,
             handleLoadAdminUsers,
-            handleToggleUserRole
+            handleToggleUserRole,
+            handleOpenPermissions,
+            collaborators,
+            adminSearch,
+            setAdminSearch,
+            adminRoleFilter,
+            setAdminRoleFilter
           )}
-        {!["dashboard", "tickets", "collab", "settings", "version", "admin"].includes(page) && renderPlaceholder(page)}
+        {!["dashboard", "tickets", "audits", "compare", "collab", "settings", "version", "admin"].includes(page) && renderPlaceholder(page)}
 
       </main>
       {historyModal}
+      {permissionsModal}
 
       {historyToasts.length > 0 ? (
         <div className="history-toast-stack">
@@ -6924,9 +10350,12 @@ function App() {
           voiceStep,
           voiceFeedback,
           selectedMonth,
+          ticketCategoryPromptOpen,
+          ticketFollowUpPrompt,
           handleCloseTicketModal,
           handleSubmitTicket,
-          (patch) => setNewTicketForm((current) => ({ ...current, ...patch })),
+          handleAnotherTicketChoice,
+          handleNewTicketFormChange,
           handleToggleVoice
         )}
     </div>

@@ -31,7 +31,9 @@ function doGet(e) {
         montant: montant,
         sent: !!sentMap[rowKey],
         envoye: !!sentMap[rowKey],
-        sortIndex: sortIndex
+        sortIndex: sortIndex,
+        sheetRow: Number(ligne.sheetRow || 0),
+        blockIndex: Number(ligne.blockIndex || 0)
       });
     });
   });
@@ -102,6 +104,23 @@ function doPost(e) {
       }
 
       const result = supprimerRemboursementApi_(mois, row);
+      return jsonOutput_({ success: true, result: result });
+    }
+
+    if (action === "updateTicket") {
+      const mois = String(data.mois || "").trim();
+      const sheetRow = Number(data.sheetRow || 0);
+      const blockIndex = Number(data.blockIndex || 0);
+      const date = String(data.date || "").trim();
+      const description = String(data.description || "").trim();
+      const categorie = String(data.categorie || "").trim();
+      const montant = String(data.montant || "").trim();
+
+      if (!mois || !sheetRow || !date || !description || !categorie || !montant) {
+        throw new Error("Champs obligatoires manquants pour la modification.");
+      }
+
+      const result = updateTicketApi_(mois, sheetRow, blockIndex, date, montant, description, categorie);
       return jsonOutput_({ success: true, result: result });
     }
 
@@ -184,7 +203,7 @@ function getRecapData(mois) {
   function readBlocks(blocks) {
     const items = [];
 
-    blocks.forEach(function (block) {
+    blocks.forEach(function (block, blockIdx) {
       const values = sh.getRange(`${block.date}8:${block.cat}40`).getValues();
 
       for (let i = 0; i < values.length; i += 1) {
@@ -214,7 +233,9 @@ function getRecapData(mois) {
           montant: Number(montantRaw),
           description: String(descRaw || ""),
           categorie: String(catRaw || ""),
-          sortIndex: rowNumber
+          sortIndex: rowNumber,
+          sheetRow: rowNumber,
+          blockIndex: blockIdx
         });
       }
     });
@@ -422,6 +443,11 @@ function getAllUserRows_() {
 }
 
 function getEffectiveRole_(user, allUsers) {
+  var FOUNDER_EMAIL = "schjeanseb@gmail.com";
+  if (String(user.email || "").toLowerCase() === FOUNDER_EMAIL) {
+    return "admin";
+  }
+
   const users = Array.isArray(allUsers) ? allUsers : getAllUserRows_();
   const hasExplicitAdmin = users.some(function (item) {
     return String(item.role || "") === "admin";
@@ -692,6 +718,7 @@ function listAllAccounts_(data) {
 }
 
 function updateUserRole_(data) {
+  var FOUNDER_EMAIL = "schjeanseb@gmail.com";
   var adminEmail = normalizeAccountEmail_(data.adminEmail);
   var sessionToken = String(data.sessionToken || "");
   var targetEmail = normalizeAccountEmail_(data.targetEmail);
@@ -701,6 +728,14 @@ function updateUserRole_(data) {
 
   if (!targetUser) {
     throw new Error("Compte cible introuvable.");
+  }
+
+  if (targetUser.email === FOUNDER_EMAIL) {
+    throw new Error("Impossible de modifier le role du fondateur.");
+  }
+
+  if (adminUser.email !== FOUNDER_EMAIL) {
+    throw new Error("Seul le fondateur peut modifier les roles.");
   }
 
   if (adminUser.email === targetUser.email && role !== "admin") {
@@ -812,6 +847,67 @@ function traiterTicketApi_(mois, dateStr, montantStr, description, categorie) {
     mois: mois,
     ligne: ligne,
     cellule: colonnes.date + ligne
+  };
+}
+
+function updateTicketApi_(mois, sheetRow, blockIndex, dateStr, montantStr, description, categorie) {
+  const ss = getBudgetSpreadsheet_();
+  const feuille = ss.getSheetByName(mois);
+
+  if (!feuille) {
+    throw new Error("Onglet introuvable : " + mois);
+  }
+
+  const allBlocks = [
+    { date: "K", montant: "L", desc: "M", cat: "N" },
+    { date: "Q", montant: "R", desc: "S", cat: "T" },
+    { date: "W", montant: "X", desc: "Y", cat: "Z" }
+  ];
+
+  if (blockIndex < 0 || blockIndex >= allBlocks.length) {
+    throw new Error("Index de bloc invalide : " + blockIndex);
+  }
+
+  if (sheetRow < 8 || sheetRow > 40) {
+    throw new Error("Ligne invalide : " + sheetRow);
+  }
+
+  const colonnes = allBlocks[blockIndex];
+
+  const parts = String(dateStr || "").split("-");
+  if (parts.length !== 3) {
+    throw new Error("Date invalide.");
+  }
+
+  const yyyy = parts[0];
+  const mm = parts[1];
+  const dd = parts[2];
+
+  if (!/^\d{4}$/.test(yyyy) || !/^\d{2}$/.test(mm) || !/^\d{2}$/.test(dd)) {
+    throw new Error("Date invalide.");
+  }
+
+  const dateFormatee = dd + "/" + mm + "/" + yyyy;
+  const montant = parseFloat(String(montantStr).replace(",", "."));
+
+  if (isNaN(montant)) {
+    throw new Error("Montant invalide.");
+  }
+
+  feuille.getRange(colonnes.date + sheetRow).setValue(dateFormatee);
+
+  const cellMontant = feuille.getRange(colonnes.montant + sheetRow);
+  cellMontant.setValue(montant);
+  cellMontant.setNumberFormat("#,##0.00");
+
+  feuille.getRange(colonnes.desc + sheetRow).setValue(description);
+  feuille.getRange(colonnes.cat + sheetRow).setValue(categorie);
+
+  return {
+    mois: mois,
+    sheetRow: sheetRow,
+    blockIndex: blockIndex,
+    cellule: colonnes.date + sheetRow
   };
 }
 

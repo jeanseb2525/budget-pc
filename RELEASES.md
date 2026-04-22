@@ -109,20 +109,37 @@ git push origin v0.1.20
 
 
 
-## 7. Patch notes 0.1.21
 
+## Patch notes précédentes
+
+### v0.1.22 (22/04/2026)
+- Refonte de l'affichage de synchronisation (temps réel depuis la dernière actualisation)
+- Correction des valeurs affichées dans les cartes (cohérence des données restaurée)
+- Amélioration du rendu global du dashboard (espacement, lisibilité, structure, fonds des cadres)
+- Cadre Audit initialisé (base fonctionnelle en place)
+- Dépenses non prévues désormais cliquables (accès au détail)
+- Comparateur fonctionnel (à peaufiner)
+- Suppression des sous-titres dans les cartes solde / reste en cours / reste théorique / dépenses non prévues
+- Tickets : ajout du bouton "Vue feuille" pour accès rapide à l'ensemble des tickets
+
+### v0.1.21 (15/04/2026)
 - Correction et amélioration de l'affichage des cartes Courses et Essence sur le dashboard
 - Amélioration du menu Admin (ergonomie, gestion des rôles, accès, à améliorer)
 - Modification du système de tickets (ajout, édition, suivi)
 - Ajout de la création de ticket (fonctionnelle mais à améliorer)
 - Divers correctifs et ajustements visuels
 
-
-## Patch notes précédentes
+### v0.1.20 (14/044/2026)
+- Ajout du panel Admin (acces restreint aux admins)
+- Liste des comptes avec email, prenom, nom, pseudo, couleur et role
+- Promotion / retrait du role admin pour les co-gerants
+- Blocage d acces aux actions admin sans autorisation
+- Compteur utilisateurs en ligne cliquable avec popup des noms
+- Refonte visuelle des cartes Courses / Essence sur le dashboard
+- Backend comptes et securite: role admin/user + sessionToken + actions admin
 
 ### v0.1.19 (14/04/2026)
 Correction de l'affichage Invalid Date sur l'écran de mise à jour
-
 
 ### v0.1.18 (14/04/2026)
 Correction de l'ordre des derniers tickets sur le dashboard (les plus récents en premier)
