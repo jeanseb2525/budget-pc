@@ -83,6 +83,11 @@ function doPost(e) {
       return jsonOutput_({ success: true, account: account });
     }
 
+    if (action === "updateUserPermissions") {
+      const account = updateUserPermissions_(data);
+      return jsonOutput_({ success: true, account: account });
+    }
+
     if (action === "addReimbursements") {
       const mois = String(data.mois || "").trim();
       const entries = Array.isArray(data.entries) ? data.entries : [];
@@ -400,19 +405,93 @@ function ensureUsersSheet_() {
     "updatedAt",
     "pseudo",
     "role",
-    "sessionToken"
+    "sessionToken",
+    "pagePermissions"
   ]];
 
   if (!sh) {
     sh = ss.insertSheet(USERS_SHEET_NAME);
-    sh.getRange(1, 1, 1, 12).setValues(headers);
+    sh.getRange(1, 1, 1, 13).setValues(headers);
     sh.hideSheet();
-  } else if (sh.getLastColumn() < 12) {
-    sh.insertColumnsAfter(sh.getLastColumn(), 12 - sh.getLastColumn());
-    sh.getRange(1, 1, 1, 12).setValues(headers);
+  } else if (sh.getLastColumn() < 13) {
+    sh.insertColumnsAfter(sh.getLastColumn(), 13 - sh.getLastColumn());
+    sh.getRange(1, 1, 1, 13).setValues(headers);
   }
 
   return sh;
+}
+
+function getDefaultUserPagePermissions_() {
+  return {
+    dashboard: false,
+    tickets: false,
+    annual: false,
+    audits: false,
+    compare: false,
+    subscriptions: false,
+    collab: false,
+    settings: true,
+    version: true,
+    admin: false
+  };
+}
+
+function getDefaultAdminPagePermissions_() {
+  return {
+    dashboard: true,
+    tickets: true,
+    annual: true,
+    audits: true,
+    compare: true,
+    subscriptions: true,
+    collab: true,
+    settings: true,
+    version: true,
+    admin: true
+  };
+}
+
+function normalizeBooleanPermission_(value, fallback) {
+  if (typeof value === "boolean") {
+    return value;
+  }
+
+  if (typeof value === "number") {
+    return value === 1;
+  }
+
+  if (typeof value === "string") {
+    var normalized = value.trim().toLowerCase();
+    if (["true", "1", "yes", "oui"].indexOf(normalized) !== -1) return true;
+    if (["false", "0", "no", "non"].indexOf(normalized) !== -1) return false;
+  }
+
+  return fallback;
+}
+
+function normalizePagePermissions_(rawPermissions, fallbackPermissions) {
+  var source = rawPermissions;
+  if (typeof source === "string" && source.trim()) {
+    try {
+      source = JSON.parse(source);
+    } catch (err) {
+      source = null;
+    }
+  }
+
+  var fallback = fallbackPermissions || getDefaultUserPagePermissions_();
+  var keys = ["dashboard", "tickets", "annual", "audits", "compare", "subscriptions", "collab", "settings", "version", "admin"];
+  var permissions = {};
+
+  keys.forEach(function (key) {
+    permissions[key] = normalizeBooleanPermission_(source && typeof source === "object" ? source[key] : undefined, fallback[key]);
+  });
+
+  return permissions;
+}
+
+function stringifyPagePermissions_(permissions) {
+  return JSON.stringify(normalizePagePermissions_(permissions, getDefaultUserPagePermissions_()));
 }
 
 function getAllUserRows_() {
@@ -423,7 +502,10 @@ function getAllUserRows_() {
     return [];
   }
 
-  return sh.getRange(2, 1, lastRow - 1, 12).getValues().map(function (row, index) {
+  return sh.getRange(2, 1, lastRow - 1, 13).getValues().map(function (row, index) {
+    var role = String(row[10] || "") === "admin" ? "admin" : "user";
+    var fallbackPermissions = role === "admin" ? getDefaultAdminPagePermissions_() : getDefaultUserPagePermissions_();
+
     return {
       rowNumber: index + 2,
       id: String(row[0] || ""),
@@ -436,8 +518,9 @@ function getAllUserRows_() {
       createdAt: String(row[7] || ""),
       updatedAt: String(row[8] || ""),
       pseudo: String(row[9] || ""),
-      role: String(row[10] || "") === "admin" ? "admin" : "user",
-      sessionToken: String(row[11] || "")
+      role: role,
+      sessionToken: String(row[11] || ""),
+      pagePermissions: normalizePagePermissions_(row[12] || "", fallbackPermissions)
     };
   });
 }
@@ -485,6 +568,9 @@ function toPublicAccount_(user) {
     createdAt: String(user.createdAt || ""),
     pseudo: String(user.pseudo || ""),
     role: getEffectiveRole_(user, users),
+    pagePermissions: getEffectiveRole_(user, users) === "admin"
+      ? getDefaultAdminPagePermissions_()
+      : normalizePagePermissions_(user.pagePermissions, getDefaultUserPagePermissions_()),
     sessionToken: String(user.sessionToken || "")
   };
 }
@@ -522,6 +608,9 @@ function signUpAccount_(data) {
   const sessionToken = createSessionToken_();
   const isFirstAccount = getAllUserRows_().length === 0;
   const role = isFirstAccount ? "admin" : "user";
+  const pagePermissions = role === "admin"
+    ? getDefaultAdminPagePermissions_()
+    : normalizePagePermissions_(data.pagePermissions, getDefaultUserPagePermissions_());
 
   sh.appendRow([
     id,
@@ -535,7 +624,8 @@ function signUpAccount_(data) {
     now,
     pseudo,
     role,
-    sessionToken
+    sessionToken,
+    stringifyPagePermissions_(pagePermissions)
   ]);
 
   return {
@@ -547,6 +637,7 @@ function signUpAccount_(data) {
     createdAt: now,
     pseudo: pseudo,
     role: role,
+    pagePermissions: pagePermissions,
     sessionToken: sessionToken
   };
 }
@@ -620,7 +711,7 @@ function updateAccountProfile_(data) {
   const nextSalt = newPassword ? createPasswordSalt_() : user.passwordSalt;
   const nextHash = newPassword ? buildPasswordHash_(newPassword, nextSalt) : user.passwordHash;
 
-  sh.getRange(user.rowNumber, 1, 1, 12).setValues([[
+  sh.getRange(user.rowNumber, 1, 1, 13).setValues([[
     user.id,
     nextEmail,
     firstName,
@@ -632,7 +723,8 @@ function updateAccountProfile_(data) {
     now,
     pseudo,
     user.role || "user",
-    user.sessionToken || ""
+    user.sessionToken || "",
+    stringifyPagePermissions_(user.pagePermissions)
   ]]);
 
   return {
@@ -644,6 +736,9 @@ function updateAccountProfile_(data) {
     createdAt: user.createdAt,
     pseudo: pseudo,
     role: getEffectiveRole_(user),
+    pagePermissions: getEffectiveRole_(user) === "admin"
+      ? getDefaultAdminPagePermissions_()
+      : normalizePagePermissions_(user.pagePermissions, getDefaultUserPagePermissions_()),
     sessionToken: String(user.sessionToken || "")
   };
 }
@@ -665,7 +760,7 @@ function updateQuickProfile_(data) {
   var sh = ensureUsersSheet_();
   var now = new Date().toISOString();
 
-  sh.getRange(user.rowNumber, 1, 1, 12).setValues([[
+  sh.getRange(user.rowNumber, 1, 1, 13).setValues([[
     user.id,
     user.email,
     user.firstName,
@@ -677,7 +772,8 @@ function updateQuickProfile_(data) {
     now,
     pseudo,
     user.role || "user",
-    user.sessionToken || ""
+    user.sessionToken || "",
+    stringifyPagePermissions_(user.pagePermissions)
   ]]);
 
   return {
@@ -689,6 +785,9 @@ function updateQuickProfile_(data) {
     createdAt: user.createdAt,
     pseudo: pseudo,
     role: getEffectiveRole_(user),
+    pagePermissions: getEffectiveRole_(user) === "admin"
+      ? getDefaultAdminPagePermissions_()
+      : normalizePagePermissions_(user.pagePermissions, getDefaultUserPagePermissions_()),
     sessionToken: String(user.sessionToken || "")
   };
 }
@@ -744,8 +843,11 @@ function updateUserRole_(data) {
 
   var sh = ensureUsersSheet_();
   var now = new Date().toISOString();
+  var nextPermissions = role === "admin"
+    ? getDefaultAdminPagePermissions_()
+    : getDefaultUserPagePermissions_();
 
-  sh.getRange(targetUser.rowNumber, 1, 1, 12).setValues([[
+  sh.getRange(targetUser.rowNumber, 1, 1, 13).setValues([[
     targetUser.id,
     targetUser.email,
     targetUser.firstName,
@@ -757,10 +859,55 @@ function updateUserRole_(data) {
     now,
     targetUser.pseudo,
     role,
-    targetUser.sessionToken || ""
+    targetUser.sessionToken || "",
+    stringifyPagePermissions_(nextPermissions)
   ]]);
 
   targetUser.role = role;
+  targetUser.pagePermissions = nextPermissions;
+  targetUser.updatedAt = now;
+  return toPublicAccount_(targetUser);
+}
+
+function updateUserPermissions_(data) {
+  var FOUNDER_EMAIL = "schjeanseb@gmail.com";
+  var adminEmail = normalizeAccountEmail_(data.adminEmail);
+  var sessionToken = String(data.sessionToken || "");
+  var targetEmail = normalizeAccountEmail_(data.targetEmail);
+  var adminUser = requireAdminSession_(adminEmail, sessionToken);
+  var targetUser = findUserByEmail_(targetEmail);
+
+  if (!targetUser) {
+    throw new Error("Compte cible introuvable.");
+  }
+
+  if (targetUser.email === FOUNDER_EMAIL || getEffectiveRole_(targetUser) === "admin") {
+    throw new Error("Les autorisations des admins sont gerees par leur role.");
+  }
+
+  var pagePermissions = normalizePagePermissions_(data.pagePermissions, getDefaultUserPagePermissions_());
+  pagePermissions.admin = false;
+
+  var sh = ensureUsersSheet_();
+  var now = new Date().toISOString();
+
+  sh.getRange(targetUser.rowNumber, 1, 1, 13).setValues([[
+    targetUser.id,
+    targetUser.email,
+    targetUser.firstName,
+    targetUser.lastName,
+    targetUser.cursorColor,
+    targetUser.passwordSalt,
+    targetUser.passwordHash,
+    targetUser.createdAt,
+    now,
+    targetUser.pseudo,
+    targetUser.role || "user",
+    targetUser.sessionToken || "",
+    stringifyPagePermissions_(pagePermissions)
+  ]]);
+
+  targetUser.pagePermissions = pagePermissions;
   targetUser.updatedAt = now;
   return toPublicAccount_(targetUser);
 }

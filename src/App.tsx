@@ -2,6 +2,7 @@
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { createClient, type RealtimeChannel } from "@supabase/supabase-js";
 import {
+  type ChangeEvent,
   useDeferredValue,
   useEffect,
   useRef,
@@ -53,6 +54,63 @@ type NewTicketForm = {
   amount: string;
   description: string;
   category: string;
+};
+
+type CsvImportDraft = {
+  id: string;
+  sourceRow: number;
+  sourceType: string;
+  include: boolean;
+  note: string;
+  date: string;
+  amount: string;
+  description: string;
+  category: string;
+  error: string;
+};
+
+type CsvImportSummaryItem = {
+  label: string;
+  count: number;
+};
+
+type CsvImportSummary = {
+  totalRows: number;
+  hardSkippedRows: number;
+  ignoredByReason: CsvImportSummaryItem[];
+};
+
+type CsvImportSessionParticipant = {
+  id: string;
+  name: string;
+  color: string;
+  lastSeen: number;
+};
+
+type SharedCsvImportSession = {
+  id: string;
+  ownerId: string;
+  ownerName: string;
+  ownerColor: string;
+  submittingById: string;
+  submittingByName: string;
+  fileName: string;
+  targetMonth: string;
+  summary: CsvImportSummary;
+  drafts: CsvImportDraft[];
+  participants: CsvImportSessionParticipant[];
+  status: string;
+  startedAt: number;
+  updatedAt: number;
+};
+
+type CsvImportParsedRow = {
+  sourceRow: number;
+  sourceType: string;
+  dateStart: string;
+  month: string;
+  description: string;
+  signedAmount: number;
 };
 
 type ReimbursementFormLine = {
@@ -125,6 +183,19 @@ type AccountPagePermissions = {
   admin: boolean;
 };
 
+const accountPagePermissionKeys: (keyof AccountPagePermissions)[] = [
+  "dashboard",
+  "tickets",
+  "annual",
+  "audits",
+  "compare",
+  "subscriptions",
+  "collab",
+  "settings",
+  "version",
+  "admin",
+];
+
 type AccountProfile = {
   id: string;
   email: string;
@@ -140,12 +211,12 @@ type AccountProfile = {
 };
 
 const defaultUserPagePermissions: AccountPagePermissions = {
-  dashboard: true,
-  tickets: true,
+  dashboard: false,
+  tickets: false,
   annual: false,
   audits: false,
   compare: false,
-  subscriptions: true,
+  subscriptions: false,
   collab: false,
   settings: true,
   version: true,
@@ -164,6 +235,10 @@ const defaultAdminPagePermissions: AccountPagePermissions = {
   version: true,
   admin: true,
 };
+
+function clonePagePermissions(permissions: AccountPagePermissions): AccountPagePermissions {
+  return { ...permissions };
+}
 
 type AuthMode = "signin" | "signup";
 
@@ -408,6 +483,18 @@ type CollabMessage =
       type: "subscriptions";
       user: CollabIdentity;
       subscriptions: DashboardSubscription[];
+      timestamp: number;
+    }
+  | {
+      type: "permissions";
+      targetEmail: string;
+      pagePermissions: AccountPagePermissions;
+      timestamp: number;
+    }
+  | {
+      type: "importSession";
+      user: CollabIdentity;
+      session: SharedCsvImportSession | null;
       timestamp: number;
     };
 
@@ -673,9 +760,19 @@ const collabSharedNoteStorageKey = "budget-pc-collab-shared-note";
 const authAccountsStorageKey = "budget-pc-auth-accounts";
 const authSessionStorageKey = "budget-pc-auth-session";
 const dashboardSubscriptionsStorageKey = "budget-pc-dashboard-subscriptions";
+const historyEventsStoragePrefix = "budget-pc-history-events";
 const collabPresenceTimeoutMs = 7_000;
 const collabSignalLifetimeMs = 4_800;
-const collabColors = ["#f58d68", "#f2c56e", "#76d0b2", "#90bbea", "#ff9b7a", "#b8a1ff"];
+const collabColors = [
+  // Chauds
+  "#f58d68", "#ff9b7a", "#f2c56e", "#e8a44a", "#f07070", "#e8647a",
+  // Froids
+  "#90bbea", "#76b8f0", "#76d0b2", "#5ec4b8", "#82c4e8", "#6aabff",
+  // Violets / roses
+  "#b8a1ff", "#c97aed", "#e08ccc", "#f0a0c8",
+  // Neutres lumineux
+  "#a8d4a0", "#d4c4a0",
+];
 const pageKeys: PageKey[] = [
   "dashboard",
   "tickets",
@@ -736,6 +833,50 @@ function getAccountDisplayName(account: Pick<AccountProfile, "pseudo" | "firstNa
   return fullName || account.email;
 }
 
+function parseBooleanPermissionValue(value: unknown, fallback: boolean) {
+  if (typeof value === "boolean") {
+    return value;
+  }
+
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["true", "1", "yes", "oui"].includes(normalized)) return true;
+    if (["false", "0", "no", "non"].includes(normalized)) return false;
+  }
+
+  if (typeof value === "number") {
+    return value === 1;
+  }
+
+  return fallback;
+}
+
+function normalizePagePermissions(
+  rawPermissions: unknown,
+  fallbackPermissions: AccountPagePermissions
+): AccountPagePermissions {
+  let source = rawPermissions;
+
+  if (typeof source === "string" && source.trim()) {
+    try {
+      source = JSON.parse(source);
+    } catch {
+      source = null;
+    }
+  }
+
+  if (!source || typeof source !== "object") {
+    return clonePagePermissions(fallbackPermissions);
+  }
+
+  const row = source as Record<string, unknown>;
+
+  return accountPagePermissionKeys.reduce((permissions, key) => {
+    permissions[key] = parseBooleanPermissionValue(row[key], fallbackPermissions[key]);
+    return permissions;
+  }, {} as AccountPagePermissions);
+}
+
 function normalizeAccountProfile(data: unknown): AccountProfile | null {
   if (!data || typeof data !== "object") {
     return null;
@@ -762,27 +903,11 @@ function normalizeAccountProfile(data: unknown): AccountProfile | null {
       ? defaultAdminPagePermissions
       : defaultUserPagePermissions;
 
-  const rawPermissions =
-    row.pagePermissions && typeof row.pagePermissions === "object"
-      ? (row.pagePermissions as Record<string, unknown>)
-      : row.page_permissions && typeof row.page_permissions === "object"
-        ? (row.page_permissions as Record<string, unknown>)
-        : null;
-
-  const pagePermissions: AccountPagePermissions = rawPermissions
-    ? {
-        dashboard: Boolean(rawPermissions.dashboard ?? fallbackPermissions.dashboard),
-        tickets: Boolean(rawPermissions.tickets ?? fallbackPermissions.tickets),
-        annual: Boolean(rawPermissions.annual ?? fallbackPermissions.annual),
-        audits: Boolean(rawPermissions.audits ?? fallbackPermissions.audits),
-        compare: Boolean(rawPermissions.compare ?? fallbackPermissions.compare),
-        subscriptions: Boolean(rawPermissions.subscriptions ?? fallbackPermissions.subscriptions),
-        collab: Boolean(rawPermissions.collab ?? fallbackPermissions.collab),
-        settings: Boolean(rawPermissions.settings ?? fallbackPermissions.settings),
-        version: Boolean(rawPermissions.version ?? fallbackPermissions.version),
-        admin: Boolean(rawPermissions.admin ?? fallbackPermissions.admin),
-      }
-    : fallbackPermissions;
+  const rawPermissions = row.pagePermissions ?? row.page_permissions ?? null;
+  const pagePermissions =
+    role === "founder" || role === "admin"
+      ? clonePagePermissions(defaultAdminPagePermissions)
+      : normalizePagePermissions(rawPermissions, fallbackPermissions);
 
   return {
     id: String(row.id ?? row.userId ?? row.uuid ?? email),
@@ -871,6 +996,89 @@ function persistSessionAccount(account: AccountProfile | null) {
   window.localStorage.setItem(authSessionStorageKey, JSON.stringify(normalized));
 }
 
+function getHistoryEventsStorageKey(email: string) {
+  return `${historyEventsStoragePrefix}:${normalizeEmail(email) || "anonymous"}`;
+}
+
+function normalizeHistoryEvent(data: unknown): HistoryEvent | null {
+  if (!data || typeof data !== "object") {
+    return null;
+  }
+
+  const row = data as Record<string, unknown>;
+  const createdAt = toNumber(row.createdAt ?? row.timestamp ?? 0);
+  const title = String(row.title ?? "");
+  const detail = String(row.detail ?? "");
+  const source = row.source === "sheet" ? "sheet" : "app";
+  const tone =
+    row.tone === "ok" || row.tone === "warn" || row.tone === "info"
+      ? row.tone
+      : "info";
+  const shortcut =
+    row.shortcut === "Ctrl+Z" || row.shortcut === "Ctrl+Y"
+      ? row.shortcut
+      : null;
+
+  if (!createdAt || !title) {
+    return null;
+  }
+
+  return {
+    id: String(row.id ?? `${createdAt}-${hashString(`${source}:${title}:${detail}`)}`),
+    tone,
+    source,
+    title,
+    detail,
+    shortcut,
+    createdAt,
+    author: typeof row.author === "string" ? row.author : undefined,
+  };
+}
+
+function loadStoredHistoryEvents(email: string) {
+  if (typeof window === "undefined") {
+    return [] as HistoryEvent[];
+  }
+
+  const raw = window.localStorage.getItem(getHistoryEventsStorageKey(email));
+  if (!raw) {
+    return [] as HistoryEvent[];
+  }
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      return [] as HistoryEvent[];
+    }
+
+    return parsed
+      .map((item) => normalizeHistoryEvent(item))
+      .filter((item): item is HistoryEvent => item !== null)
+      .sort((left, right) => right.createdAt - left.createdAt);
+  } catch {
+    return [] as HistoryEvent[];
+  }
+}
+
+function isSameHistoryEvent(left: HistoryEvent, right: HistoryEvent) {
+  return (
+    left.source === right.source &&
+    left.title === right.title &&
+    left.detail === right.detail &&
+    (left.author || "") === (right.author || "") &&
+    left.shortcut === right.shortcut &&
+    Math.abs(left.createdAt - right.createdAt) < 1500
+  );
+}
+
+function prependHistoryEvent(current: HistoryEvent[], event: HistoryEvent) {
+  if (current.some((item) => item.id === event.id || isSameHistoryEvent(item, event))) {
+    return current;
+  }
+
+  return [event, ...current].sort((left, right) => right.createdAt - left.createdAt);
+}
+
 function persistCollabIdentity(identity: CollabIdentity) {
   if (typeof window === "undefined") {
     return;
@@ -939,22 +1147,37 @@ function getPageLabel(page: PageKey) {
 }
 
 function getEditablePermissions(account: AccountProfile): AccountPagePermissions {
-  if (account.role === "founder") {
-    return {
-      dashboard: true,
-      tickets: true,
-      annual: true,
-      audits: true,
-      compare: true,
-      subscriptions: true,
-      collab: true,
-      settings: true,
-      version: true,
-      admin: true,
-    };
+  if (account.role === "founder" || account.role === "admin") {
+    return clonePagePermissions(defaultAdminPagePermissions);
   }
 
   return { ...account.pagePermissions };
+}
+
+function canAccessPage(account: AccountProfile, page: PageKey) {
+  if (account.role === "founder" || account.role === "admin") {
+    return true;
+  }
+
+  if (page === "admin") {
+    return false;
+  }
+
+  return Boolean(account.pagePermissions[page]);
+}
+
+function getFirstAccessiblePage(account: AccountProfile) {
+  return pageKeys.find((candidate) => canAccessPage(account, candidate)) ?? "dashboard";
+}
+
+function mergeAccountPermissions(
+  account: AccountProfile,
+  pagePermissions: AccountPagePermissions
+): AccountProfile {
+  return normalizeAccountProfile({
+    ...account,
+    pagePermissions,
+  }) ?? account;
 }
 
 function getTicketKey(ticket: Ticket) {
@@ -1205,6 +1428,581 @@ function inferCategoryFromDescription(description: string) {
   }
 
   return "";
+}
+
+function createEmptyCsvImportSummary(): CsvImportSummary {
+  return {
+    totalRows: 0,
+    hardSkippedRows: 0,
+    ignoredByReason: [],
+  };
+}
+
+function createCsvImportDraftId(seed: string) {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID();
+  }
+
+  return `csv-${seed}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function normalizeCsvHeader(value: string) {
+  return normalizeText(value).replace(/[^\w]+/g, " ").trim();
+}
+
+function parseCsvTable(text: string) {
+  const source = text.replace(/^\uFEFF/, "");
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let cell = "";
+  let inQuotes = false;
+
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+
+    if (char === "\"") {
+      if (inQuotes && source[index + 1] === "\"") {
+        cell += "\"";
+        index += 1;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
+    }
+
+    if (char === "," && !inQuotes) {
+      row.push(cell.trim());
+      cell = "";
+      continue;
+    }
+
+    if ((char === "\n" || char === "\r") && !inQuotes) {
+      if (char === "\r" && source[index + 1] === "\n") {
+        index += 1;
+      }
+
+      row.push(cell.trim());
+      cell = "";
+
+      if (row.some((value) => value !== "")) {
+        rows.push(row);
+      }
+
+      row = [];
+      continue;
+    }
+
+    cell += char;
+  }
+
+  if (cell !== "" || row.length > 0) {
+    row.push(cell.trim());
+    if (row.some((value) => value !== "")) {
+      rows.push(row);
+    }
+  }
+
+  return rows;
+}
+
+function findCsvColumnIndex(headers: string[], aliases: string[]) {
+  const normalizedHeaders = headers.map(normalizeCsvHeader);
+  const normalizedAliases = aliases.map(normalizeCsvHeader);
+  const exactMatchIndex = normalizedHeaders.findIndex((header) => normalizedAliases.includes(header));
+
+  if (exactMatchIndex >= 0) {
+    return exactMatchIndex;
+  }
+
+  return normalizedHeaders.findIndex((header) =>
+    normalizedAliases.some((alias) => header.includes(alias) || alias.includes(header))
+  );
+}
+
+function extractCsvImportDate(value: string) {
+  const match = value.trim().match(/^(\d{4}-\d{2}-\d{2})/);
+  return match ? match[1] : "";
+}
+
+function normalizeTicketDateForComparison(value: string) {
+  const trimmed = value.trim();
+
+  if (!trimmed) {
+    return "";
+  }
+
+  const isoMatch = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (isoMatch) {
+    return `${isoMatch[1]}-${isoMatch[2]}-${isoMatch[3]}`;
+  }
+
+  const frMatch = trimmed.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (frMatch) {
+    return `${frMatch[3]}-${frMatch[2]}-${frMatch[1]}`;
+  }
+
+  return "";
+}
+
+function getTicketDayStamp(value: string) {
+  const normalized = normalizeTicketDateForComparison(value);
+
+  if (!normalized) {
+    return Number.NaN;
+  }
+
+  return Date.parse(`${normalized}T00:00:00Z`);
+}
+
+function getTicketDateDistanceInDays(left: string, right: string) {
+  const leftStamp = getTicketDayStamp(left);
+  const rightStamp = getTicketDayStamp(right);
+
+  if (!Number.isFinite(leftStamp) || !Number.isFinite(rightStamp)) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  return Math.abs((leftStamp - rightStamp) / 86_400_000);
+}
+
+function formatCsvImportAmount(amount: number) {
+  return Math.abs(amount).toFixed(2).replace(".", ",");
+}
+
+function buildCsvImportAmountDateKey(date: string, amount: number) {
+  const normalizedDate = normalizeTicketDateForComparison(date) || date.trim();
+  return `${normalizedDate}__${amount.toFixed(2)}`;
+}
+
+function buildCsvImportDuplicateKey(date: string, description: string, amount: number) {
+  const normalizedDate = normalizeTicketDateForComparison(date) || date.trim();
+  const normalizedDescription = normalizeText(description)
+    .replace(/[^\w\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return `${normalizedDate}__${normalizedDescription}__${amount.toFixed(2)}`;
+}
+
+function buildCsvImportDescriptionTokens(value: string) {
+  return normalizeText(value)
+    .replace(/[^\w\s]/g, " ")
+    .replace(/\b(a|au|aux|de|des|du|la|le|les|to|virement|paiement|clients|particuliers|sa|co)\b/g, " ")
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 3);
+}
+
+function areCsvImportDescriptionsLikelySame(left: string, right: string) {
+  const leftTokens = buildCsvImportDescriptionTokens(left);
+  const rightTokens = buildCsvImportDescriptionTokens(right);
+
+  if (leftTokens.length === 0 || rightTokens.length === 0) {
+    return false;
+  }
+
+  const rightSet = new Set(rightTokens);
+  const overlap = leftTokens.filter((token) => rightSet.has(token));
+
+  if (overlap.length >= Math.min(2, leftTokens.length, rightTokens.length)) {
+    return true;
+  }
+
+  const leftNormalized = leftTokens.join(" ");
+  const rightNormalized = rightTokens.join(" ");
+  return leftNormalized.includes(rightNormalized) || rightNormalized.includes(leftNormalized);
+}
+
+function normalizeTicketCategoryForComparison(value: string) {
+  return normalizeText(value).replace(/[^\w\s]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function createCsvImportParticipant(identity: CollabIdentity, timestamp = Date.now()): CsvImportSessionParticipant {
+  return {
+    id: identity.id,
+    name: identity.name,
+    color: identity.color,
+    lastSeen: timestamp,
+  };
+}
+
+function upsertCsvImportParticipant(
+  participants: CsvImportSessionParticipant[],
+  participant: CsvImportSessionParticipant
+) {
+  const existing = participants.find((item) => item.id === participant.id);
+
+  if (!existing) {
+    return [...participants, participant];
+  }
+
+  return participants.map((item) => (item.id === participant.id ? { ...item, ...participant } : item));
+}
+
+function normalizeCsvImportSession(value: unknown): SharedCsvImportSession | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+
+  const row = value as Record<string, unknown>;
+  const id = String(row.id ?? "").trim();
+
+  if (!id) {
+    return null;
+  }
+
+  const rawDrafts = Array.isArray(row.drafts) ? row.drafts : [];
+  const rawParticipants = Array.isArray(row.participants) ? row.participants : [];
+
+  return {
+    id,
+    ownerId: String(row.ownerId ?? ""),
+    ownerName: String(row.ownerName ?? "Une session"),
+    ownerColor: String(row.ownerColor ?? collabColors[0]),
+    submittingById: String(row.submittingById ?? ""),
+    submittingByName: String(row.submittingByName ?? ""),
+    fileName: String(row.fileName ?? ""),
+    targetMonth: String(row.targetMonth ?? getCurrentMonthValue()),
+    summary: {
+      totalRows: toNumber((row.summary as Record<string, unknown> | undefined)?.totalRows ?? 0),
+      hardSkippedRows: toNumber((row.summary as Record<string, unknown> | undefined)?.hardSkippedRows ?? 0),
+      ignoredByReason: Array.isArray((row.summary as Record<string, unknown> | undefined)?.ignoredByReason)
+        ? (((row.summary as Record<string, unknown>).ignoredByReason as unknown[]).map((item) => {
+            const sub = item as Record<string, unknown>;
+            return {
+              label: String(sub.label ?? ""),
+              count: toNumber(sub.count ?? 0),
+            };
+          }).filter((item) => item.label))
+        : [],
+    },
+    drafts: rawDrafts.map((item, index) => {
+      const draft = item as Record<string, unknown>;
+      return {
+        id: String(draft.id ?? `draft-${index}`),
+        sourceRow: toNumber(draft.sourceRow ?? index + 1),
+        sourceType: String(draft.sourceType ?? "Operation"),
+        include: toBoolean(draft.include ?? true),
+        note: String(draft.note ?? ""),
+        date: String(draft.date ?? ""),
+        amount: String(draft.amount ?? ""),
+        description: String(draft.description ?? ""),
+        category: String(draft.category ?? ""),
+        error: String(draft.error ?? ""),
+      };
+    }),
+    participants: rawParticipants.map((item) => {
+      const participant = item as Record<string, unknown>;
+      return {
+        id: String(participant.id ?? ""),
+        name: String(participant.name ?? "Une session"),
+        color: String(participant.color ?? collabColors[0]),
+        lastSeen: toNumber(participant.lastSeen ?? Date.now()),
+      };
+    }).filter((item) => item.id),
+    status: String(row.status ?? ""),
+    startedAt: toNumber(row.startedAt ?? Date.now()),
+    updatedAt: toNumber(row.updatedAt ?? Date.now()),
+  };
+}
+
+function buildCsvImportAccountTokens(
+  account: Pick<AccountProfile, "firstName" | "lastName" | "pseudo" | "email"> | null
+) {
+  if (!account) {
+    return [];
+  }
+
+  const fullName = `${account.firstName} ${account.lastName}`.trim();
+  const parts = [
+    account.firstName,
+    account.lastName,
+    account.pseudo,
+    fullName,
+    account.email.split("@")[0] ?? "",
+  ];
+
+  return [...new Set(
+    parts
+      .flatMap((value) => normalizeText(value).split(/[\s._-]+/))
+      .map((value) => value.trim())
+      .filter((value) => value.length >= 3)
+  )];
+}
+
+function isLikelyCsvSelfTransfer(
+  description: string,
+  type: string,
+  account: Pick<AccountProfile, "firstName" | "lastName" | "pseudo" | "email"> | null
+) {
+  if (!account) {
+    return false;
+  }
+
+  const normalizedDescription = normalizeText(description)
+    .replace(/\s+/g, " ")
+    .trim();
+  const normalizedType = normalizeText(type);
+  const fullName = normalizeText(`${account.firstName} ${account.lastName}`.trim())
+    .replace(/\s+/g, " ")
+    .trim();
+  const isTransferLike =
+    normalizedType.includes("virement") ||
+    normalizedDescription.includes("virement a") ||
+    normalizedDescription.includes("transfer to") ||
+    normalizedDescription.startsWith("to ");
+
+  if (!isTransferLike) {
+    return false;
+  }
+
+  if (fullName && normalizedDescription.includes(fullName)) {
+    return true;
+  }
+
+  const tokens = buildCsvImportAccountTokens(account);
+  const matches = tokens.filter((token) => normalizedDescription.includes(token));
+  return matches.length >= 2;
+}
+
+function isLikelyExistingCsvDuplicate(
+  row: CsvImportParsedRow,
+  existingTickets: Ticket[],
+  inferredCategory: string
+) {
+  const matchingAmountTickets = existingTickets.filter(
+    (ticket) => Math.abs(ticket.amount - Math.abs(row.signedAmount)) < 0.001
+  );
+
+  if (matchingAmountTickets.length === 0) {
+    return false;
+  }
+
+  const nearbyAmountTickets = matchingAmountTickets.filter((ticket) => {
+    return getTicketDateDistanceInDays(ticket.date, row.dateStart) <= 1;
+  });
+
+  if (nearbyAmountTickets.length === 0) {
+    return false;
+  }
+
+  const normalizedCsvCategory = normalizeTicketCategoryForComparison(inferredCategory);
+  const hasStrongTextOrCategoryMatch = nearbyAmountTickets.some((ticket) => {
+    const normalizedExistingCategory = normalizeTicketCategoryForComparison(ticket.category || "");
+
+    if (
+      normalizedCsvCategory &&
+      normalizedExistingCategory &&
+      normalizedCsvCategory === normalizedExistingCategory
+    ) {
+      return true;
+    }
+
+    return areCsvImportDescriptionsLikelySame(row.description, ticket.description || "");
+  });
+
+  if (hasStrongTextOrCategoryMatch) {
+    return true;
+  }
+
+  return nearbyAmountTickets.length === 1 && matchingAmountTickets.length === 1;
+}
+
+function consumeCsvImportMatchCounter(counter: Map<string, number>, key: string) {
+  counter.set(key, (counter.get(key) ?? 0) + 1);
+}
+
+function detectCsvImportTargetMonth(rows: CsvImportParsedRow[], preferredMonth: string) {
+  const monthCounts = rows.reduce((map, row) => {
+    map.set(row.month, (map.get(row.month) ?? 0) + 1);
+    return map;
+  }, new Map<string, number>());
+
+  if (monthCounts.size === 0) {
+    return preferredMonth;
+  }
+
+  return [...monthCounts.entries()]
+    .sort((left, right) => {
+      if (right[1] !== left[1]) {
+        return right[1] - left[1];
+      }
+
+      if (left[0] === preferredMonth) {
+        return -1;
+      }
+
+      if (right[0] === preferredMonth) {
+        return 1;
+      }
+
+      return right[0].localeCompare(left[0], "fr");
+    })[0][0];
+}
+
+function parseRevolutCsvImport(
+  csvText: string,
+  preferredMonth: string,
+  existingTickets: Ticket[],
+  account: Pick<AccountProfile, "firstName" | "lastName" | "pseudo" | "email"> | null
+) {
+  const rows = parseCsvTable(csvText);
+
+  if (rows.length < 2) {
+    throw new Error("Le fichier CSV semble vide ou incomplet.");
+  }
+
+  const [headers, ...dataRows] = rows;
+  const indices = {
+    type: findCsvColumnIndex(headers, ["Type"]),
+    dateStart: findCsvColumnIndex(headers, ["Date de debut", "Date de début", "Date debut"]),
+    description: findCsvColumnIndex(headers, ["Description"]),
+    amount: findCsvColumnIndex(headers, ["Montant"]),
+    state: findCsvColumnIndex(headers, ["Etat", "État"]),
+  };
+
+  if (indices.dateStart < 0 || indices.description < 0 || indices.amount < 0) {
+    throw new Error("Colonnes Revolut introuvables dans ce CSV.");
+  }
+
+  const ignoredByReason = new Map<string, number>();
+  const candidateRows: CsvImportParsedRow[] = [];
+  const drafts: CsvImportDraft[] = [];
+
+  const incrementIgnoredReason = (label: string) => {
+    ignoredByReason.set(label, (ignoredByReason.get(label) ?? 0) + 1);
+  };
+
+  dataRows.forEach((row, rowIndex) => {
+    const sourceRow = rowIndex + 2;
+    const read = (columnIndex: number) =>
+      columnIndex >= 0 ? String(row[columnIndex] ?? "").trim() : "";
+
+    const sourceType = read(indices.type);
+    const dateStart = extractCsvImportDate(read(indices.dateStart));
+    const description = read(indices.description);
+    const rawAmount = read(indices.amount);
+    const signedAmount = toNumber(rawAmount);
+    const state = read(indices.state);
+
+    if (!description) {
+      incrementIgnoredReason("Description vide");
+      return;
+    }
+
+    if (!dateStart) {
+      incrementIgnoredReason("Date de debut invalide");
+      return;
+    }
+
+    if (indices.state >= 0 && normalizeText(state) !== "termine") {
+      incrementIgnoredReason("Etat non termine");
+      return;
+    }
+
+    if (!(signedAmount < 0)) {
+      incrementIgnoredReason("Montant positif ou nul");
+      return;
+    }
+
+    candidateRows.push({
+      sourceRow,
+      sourceType: sourceType || "Operation",
+      dateStart,
+      month: dateStart.slice(5, 7),
+      description,
+      signedAmount,
+    });
+  });
+
+  const targetMonth = detectCsvImportTargetMonth(candidateRows, preferredMonth);
+  const existingExactDuplicateCounts = existingTickets.reduce((map, ticket) => {
+    const key = buildCsvImportDuplicateKey(ticket.date, ticket.description, Math.abs(ticket.amount));
+    map.set(key, (map.get(key) ?? 0) + 1);
+    return map;
+  }, new Map<string, number>());
+  const existingAmountDateCounts = existingTickets.reduce((map, ticket) => {
+    const key = buildCsvImportAmountDateKey(ticket.date, Math.abs(ticket.amount));
+    map.set(key, (map.get(key) ?? 0) + 1);
+    return map;
+  }, new Map<string, number>());
+  const consumedExactDuplicateCounts = new Map<string, number>();
+  const consumedAmountDateCounts = new Map<string, number>();
+  const acceptedDraftKeys = new Set<string>();
+
+  candidateRows.forEach((row) => {
+    const absoluteAmount = Math.abs(row.signedAmount);
+    const inferredCategory = inferCategoryFromDescription(row.description);
+
+    if (row.month !== targetMonth) {
+      incrementIgnoredReason("Autre mois detecte dans le CSV");
+      return;
+    }
+
+    const selfTransfer = isLikelyCsvSelfTransfer(row.description, row.sourceType, account);
+
+    if (selfTransfer) {
+      incrementIgnoredReason("Auto-virement ignore");
+      return;
+    }
+
+    const exactDuplicateKey = buildCsvImportDuplicateKey(row.dateStart, row.description, absoluteAmount);
+    const amountDateKey = buildCsvImportAmountDateKey(row.dateStart, absoluteAmount);
+    const matchingExistingExactCount = existingExactDuplicateCounts.get(exactDuplicateKey) ?? 0;
+    const consumedExistingExactCount = consumedExactDuplicateCounts.get(exactDuplicateKey) ?? 0;
+    const matchingExistingAmountDateCount = existingAmountDateCounts.get(amountDateKey) ?? 0;
+    const consumedExistingAmountDateCount = consumedAmountDateCounts.get(amountDateKey) ?? 0;
+
+    if (acceptedDraftKeys.has(exactDuplicateKey)) {
+      incrementIgnoredReason("Doublon dans le CSV");
+      return;
+    }
+
+    if (matchingExistingExactCount > consumedExistingExactCount) {
+      consumeCsvImportMatchCounter(consumedExactDuplicateCounts, exactDuplicateKey);
+      consumeCsvImportMatchCounter(consumedAmountDateCounts, amountDateKey);
+      incrementIgnoredReason("Ticket deja present sur ce mois");
+      return;
+    }
+
+    if (matchingExistingAmountDateCount > consumedExistingAmountDateCount) {
+      consumeCsvImportMatchCounter(consumedAmountDateCounts, amountDateKey);
+      incrementIgnoredReason("Ticket deja present sur ce mois");
+      return;
+    }
+
+    if (isLikelyExistingCsvDuplicate(row, existingTickets, inferredCategory)) {
+      incrementIgnoredReason("Ticket deja present sur ce mois");
+      return;
+    }
+
+    acceptedDraftKeys.add(exactDuplicateKey);
+
+    drafts.push({
+      id: createCsvImportDraftId(`${row.sourceRow}`),
+      sourceRow: row.sourceRow,
+      sourceType: row.sourceType,
+      include: true,
+      note: "",
+      date: row.dateStart,
+      amount: formatCsvImportAmount(absoluteAmount),
+      description: row.description,
+      category: inferredCategory,
+      error: "",
+    });
+  });
+
+  return {
+    targetMonth,
+    drafts,
+    summary: {
+      totalRows: dataRows.length,
+      hardSkippedRows: [...ignoredByReason.values()].reduce((sum, count) => sum + count, 0),
+      ignoredByReason: [...ignoredByReason.entries()]
+        .map(([label, count]) => ({ label, count }))
+        .sort((left, right) => right.count - left.count || left.label.localeCompare(right.label)),
+    } satisfies CsvImportSummary,
+  };
 }
 
 function inferAmountFromTranscript(transcript: string) {
@@ -1765,6 +2563,33 @@ async function updateUserRoleInSheets(
   }
 
   return response;
+}
+
+async function updateUserPermissionsInSheets(
+  adminEmail: string,
+  sessionToken: string,
+  targetEmail: string,
+  pagePermissions: AccountPagePermissions
+) {
+  const response = (await postSheetsAction({
+    action: "updateUserPermissions",
+    adminEmail,
+    sessionToken,
+    targetEmail,
+    pagePermissions,
+  })) as { success?: boolean; error?: string; account?: unknown; user?: unknown; profile?: unknown };
+
+  if (response?.success === false) {
+    if ((response.error || "").toLowerCase().includes("action inconnue")) {
+      throw new Error(
+        "Backend Google Apps Script pas encore mis a jour: redeploie APPS_SCRIPT.md pour activer updateUserPermissions."
+      );
+    }
+
+    throw new Error(response.error || "Mise a jour des autorisations refusee.");
+  }
+
+  return normalizeAuthResponseAccount(response);
 }
 
 function getErrorMessage(error: unknown) {
@@ -2685,7 +3510,7 @@ function buildAuditReport(
   };
 }
 
-function renderMonthFilter(selectedMonth: string, onMonthChange: (month: string) => void) {
+function renderMonthFilter(selectedMonth: string, onMonthChange: (month: string) => void, loading = false) {
   return (
     <div className="month-filter-block">
       <div className="month-filter-head">
@@ -2697,7 +3522,7 @@ function renderMonthFilter(selectedMonth: string, onMonthChange: (month: string)
           <button
             key={month.value}
             type="button"
-            className={`month-pill ${selectedMonth === month.value ? "active" : ""}`}
+            className={`month-pill ${selectedMonth === month.value ? "active" : ""} ${selectedMonth === month.value && loading ? "loading" : ""}`}
             onClick={() => onMonthChange(month.value)}
           >
             {month.label.slice(0, 3)}
@@ -3035,6 +3860,341 @@ function renderTicketModal(
   );
 }
 
+function renderCsvImportModal(
+  open: boolean,
+  fileName: string,
+  targetMonth: string,
+  currentViewMonth: string,
+  summary: CsvImportSummary,
+  drafts: CsvImportDraft[],
+  session: SharedCsvImportSession | null,
+  busy: boolean,
+  submitting: boolean,
+  error: string,
+  status: string,
+  onClose: () => void,
+  onPickAnotherFile: () => void,
+  onSelectAll: (include: boolean) => void,
+  onDraftIncludeChange: (id: string, include: boolean) => void,
+  onDraftChange: (
+    id: string,
+    patch: Partial<Pick<CsvImportDraft, "date" | "amount" | "description" | "category">>
+  ) => void,
+  onImport: () => void
+) {
+  if (!open) {
+    return null;
+  }
+
+  const selectedCount = drafts.filter((draft) => draft.include).length;
+  const blockedCount = drafts.length - selectedCount;
+  const missingCategoryCount = drafts.filter(
+    (draft) => draft.include && !draft.category.trim()
+  ).length;
+  const targetMonthLabel = getSelectedMonthLabel(targetMonth);
+  const currentViewMonthLabel = getSelectedMonthLabel(currentViewMonth);
+  const monthMismatch = targetMonth !== currentViewMonth;
+  const participants = session?.participants ?? [];
+  const ownerName = session?.ownerName?.trim() || "Une session";
+  const sessionSubmittingByName = session?.submittingByName?.trim() || "";
+  const controlsLocked = busy || submitting || Boolean(sessionSubmittingByName);
+  const submitLabel = sessionSubmittingByName
+    ? `${sessionSubmittingByName} importe...`
+    : submitting
+      ? "Import en cours..."
+      : `Importer ${selectedCount} ticket(s)`;
+
+  return (
+    <div
+      className="modal-backdrop"
+      onClick={(event) => {
+        if (event.target === event.currentTarget && !controlsLocked) {
+          onClose();
+        }
+      }}
+    >
+      <div className="csv-import-modal" onClick={(event) => event.stopPropagation()}>
+        <div className="csv-import-head">
+          <div className="csv-import-head-copy">
+            <span className="panel-kicker">Import Revolut CSV</span>
+            <h2>Verifier avant import sur {targetMonthLabel.toLowerCase()}</h2>
+            <p>
+              L app ne propose que les nouvelles depenses du mois detecte dans le CSV.
+              Tu peux ensuite ajuster categorie, libelle, date ou montant avant validation.
+            </p>
+          </div>
+
+          <div className="csv-import-head-side">
+            <div className="csv-import-presence-card">
+              <div className="csv-import-presence-head">
+                <span className="csv-import-presence-kicker">Import partage</span>
+                <span className="csv-import-file-chip">{fileName || "Fichier CSV"}</span>
+              </div>
+              <strong>{sessionSubmittingByName || ownerName}</strong>
+              <p>
+                {sessionSubmittingByName
+                  ? `${sessionSubmittingByName} est en train d envoyer les tickets.`
+                  : participants.length > 1
+                    ? `${participants.length} participant(s) relisent ce lot ensemble.`
+                    : "Session ouverte. Tu peux relire et ajuster les lignes avant import."}
+              </p>
+              {participants.length > 0 ? (
+                <div className="csv-import-participants">
+                  {participants.map((participant) => (
+                    <span key={participant.id} className="csv-import-participant-chip">
+                      <span
+                        className="csv-import-participant-dot"
+                        style={{ backgroundColor: participant.color }}
+                      />
+                      {participant.name || "Session"}
+                    </span>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+
+            <div className="csv-import-head-actions">
+              <button
+                type="button"
+                className="ghost-btn"
+                onClick={onPickAnotherFile}
+                disabled={controlsLocked}
+              >
+                Autre CSV
+              </button>
+              <button
+                type="button"
+                className="modal-close"
+                onClick={onClose}
+                disabled={Boolean(sessionSubmittingByName)}
+              >
+                Fermer
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div className="csv-import-summary">
+          <div className="csv-import-tile">
+            <span>Mois cible</span>
+            <strong>{targetMonthLabel}</strong>
+          </div>
+          <div className="csv-import-tile">
+            <span>Lignes du fichier</span>
+            <strong>{summary.totalRows}</strong>
+          </div>
+          <div className="csv-import-tile">
+            <span>Proposees</span>
+            <strong>{drafts.length}</strong>
+          </div>
+          <div className="csv-import-tile">
+            <span>Preselectionnees</span>
+            <strong>{selectedCount}</strong>
+          </div>
+          <div className="csv-import-tile">
+            <span>Ignorees auto</span>
+            <strong>{summary.hardSkippedRows}</strong>
+          </div>
+        </div>
+
+        {monthMismatch ? (
+          <div className="status info csv-import-banner">
+            Ce CSV sera importe dans {targetMonthLabel}. Vue actuelle: {currentViewMonthLabel}.
+          </div>
+        ) : null}
+
+        {summary.ignoredByReason.length > 0 ? (
+          <div className="csv-import-ignored-list">
+            {summary.ignoredByReason.map((item) => (
+              <span key={`${item.label}-${item.count}`} className="csv-import-note">
+                {item.label} x{item.count}
+              </span>
+            ))}
+          </div>
+        ) : null}
+
+        {status ? <div className="status ok csv-import-banner">{status}</div> : null}
+        {error ? <div className="status warn csv-import-banner">{error}</div> : null}
+
+        <div className="csv-import-toolbar">
+          <div className="csv-import-toolbar-copy">
+            <strong>{selectedCount} ticket(s) prets a importer</strong>
+            <span>
+              {sessionSubmittingByName
+                ? `${sessionSubmittingByName} finalise l import en ce moment`
+                : missingCategoryCount > 0
+                ? `${missingCategoryCount} categorie(s) a confirmer`
+                : blockedCount > 0
+                  ? `${blockedCount} ligne(s) actuellement sur non`
+                  : "Tout est pret"}
+            </span>
+          </div>
+          <div className="csv-import-toolbar-actions">
+            <button
+              type="button"
+              className="ghost-btn"
+              onClick={() => onSelectAll(true)}
+              disabled={controlsLocked || drafts.length === 0}
+            >
+              Tout cocher
+            </button>
+            <button
+              type="button"
+              className="ghost-btn"
+              onClick={() => onSelectAll(false)}
+              disabled={controlsLocked || drafts.length === 0}
+            >
+              Tout decocher
+            </button>
+          </div>
+        </div>
+
+        <div className="csv-import-body">
+          {drafts.length > 0 ? (
+            <div className="csv-import-list">
+              {drafts.map((draft) => (
+                <div
+                  key={draft.id}
+                  className={`csv-import-row ${draft.include ? "" : "excluded"} ${draft.error ? "has-error" : ""}`}
+                >
+                  <div className="csv-import-row-head">
+                    <div className="csv-import-row-title">
+                      <strong>{draft.description || "Sans description"}</strong>
+                      <span>
+                        Ligne CSV {draft.sourceRow} • {draft.sourceType || "Operation"}
+                      </span>
+                    </div>
+
+                    <div className="csv-import-toggle">
+                      <button
+                        type="button"
+                        className={`csv-import-toggle-btn yes ${draft.include ? "active" : ""}`}
+                        onClick={() => onDraftIncludeChange(draft.id, true)}
+                        disabled={controlsLocked}
+                      >
+                        Oui
+                      </button>
+                      <button
+                        type="button"
+                        className={`csv-import-toggle-btn no ${!draft.include ? "active" : ""}`}
+                        onClick={() => onDraftIncludeChange(draft.id, false)}
+                        disabled={controlsLocked}
+                      >
+                        Non
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="csv-import-row-main">
+                    <div className="csv-import-row-meta">
+                      <label className="csv-import-field">
+                        <span>Date</span>
+                        <input
+                          className="field-input"
+                          type="date"
+                          value={draft.date}
+                          onChange={(event) => onDraftChange(draft.id, { date: event.target.value })}
+                          disabled={controlsLocked}
+                        />
+                      </label>
+
+                      <label className="csv-import-field">
+                        <span>Montant</span>
+                        <input
+                          className="field-input"
+                          type="text"
+                          inputMode="decimal"
+                          value={draft.amount}
+                          onChange={(event) => onDraftChange(draft.id, { amount: event.target.value })}
+                          disabled={controlsLocked}
+                        />
+                      </label>
+                    </div>
+
+                    <div className="csv-import-row-grid">
+                      <label className="csv-import-field csv-import-field-wide">
+                        <span>Description</span>
+                        <input
+                          className="field-input"
+                          type="text"
+                          value={draft.description}
+                          onChange={(event) =>
+                            onDraftChange(draft.id, { description: event.target.value })
+                          }
+                          disabled={controlsLocked}
+                        />
+                      </label>
+
+                      <label className="csv-import-field csv-import-field-wide">
+                        <span>Categorie</span>
+                        <select
+                          className="field-input"
+                          value={draft.category}
+                          onChange={(event) => onDraftChange(draft.id, { category: event.target.value })}
+                          disabled={controlsLocked}
+                        >
+                          <option value="">A confirmer</option>
+                          {SHEET_ALL_CATEGORIES.map((category) => (
+                            <option key={category} value={category}>
+                              {category}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+                  </div>
+
+                  <div className="csv-import-row-notes">
+                    {draft.note ? <span className="csv-import-note warn">{draft.note}</span> : null}
+                    {!draft.category.trim() ? (
+                      <span className="csv-import-note neutral">Categorie a confirmer</span>
+                    ) : null}
+                    {draft.include ? (
+                      <span className="csv-import-note ok">Importe en attente</span>
+                    ) : null}
+                  </div>
+
+                  {draft.error ? <div className="csv-import-row-error">{draft.error}</div> : null}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="csv-import-empty">
+              <strong>Aucune ligne importable dans ce fichier.</strong>
+              <p>
+                Le CSV a ete lu, mais aucune depense negative terminee
+                ne correspond au mois selectionne.
+              </p>
+            </div>
+          )}
+        </div>
+
+        <div className="csv-import-foot">
+          <span>Les tickets importes seront crees avec `sent = false`.</span>
+          <div className="ticket-modal-actions">
+            <button
+              type="button"
+              className="ghost-btn"
+              onClick={onClose}
+              disabled={Boolean(sessionSubmittingByName)}
+            >
+              Annuler
+            </button>
+            <button
+              type="button"
+              className="primary-btn"
+              onClick={onImport}
+              disabled={controlsLocked || selectedCount === 0}
+            >
+              {submitLabel}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function renderDashboard(
   tickets: Ticket[],
   monthSummary: TicketMonthSummary | null,
@@ -3051,7 +4211,9 @@ function renderDashboard(
   subFormError: string,
   onMonthChange: (month: string) => void,
   onRefreshTickets: () => void,
+  csvImportBusy: boolean,
   onOpenTicketModal: () => void,
+  onOpenCsvImportModal: () => void,
   onToggleSubPanel: () => void,
   onToggleSubDeletePanel: () => void,
   onSubFormLabelChange: (v: string) => void,
@@ -3099,8 +4261,6 @@ function renderDashboard(
     ? "Chargement des donnees..."
     : error
       ? "Connexion Google Sheets a verifier"
-      : refreshing
-        ? "Google Sheets OK • actualisation..."
       : lastSyncAt
         ? (
             <>
@@ -3122,6 +4282,13 @@ function renderDashboard(
             <div className="dashboard-v3-actions">
               <button className="primary-btn" onClick={onOpenTicketModal}>
                 Nouvelle depense
+              </button>
+              <button
+                className="ghost-btn"
+                onClick={onOpenCsvImportModal}
+                disabled={csvImportBusy}
+              >
+                {csvImportBusy ? "Analyse CSV..." : "Importer CSV"}
               </button>
               <button className="outline-btn" onClick={onRefreshTickets}>
                 {isBusy ? "Actualisation..." : "Actualiser"}
@@ -3178,7 +4345,7 @@ function renderDashboard(
 
           <div className="dashboard-v3-right">
             <div className="dashboard-v3-period-card">
-              {renderMonthFilter(selectedMonth, onMonthChange)}
+              {renderMonthFilter(selectedMonth, onMonthChange, loading)}
             </div>
             <div className="dashboard-v3-total-card">
               <div className="dashboard-v3-total-main">
@@ -3199,7 +4366,7 @@ function renderDashboard(
         </div>
       </section>
 
-      <section className="stats-grid dashboard-v3-kpi-grid">
+      <section className={`stats-grid dashboard-v3-kpi-grid ${loading ? "section-fading" : ""}`}>
         <article className="card accent-blue dashboard-v3-kpi-card">
           <span className="card-label">Solde du compte</span>
           <strong className="card-value">
@@ -3231,7 +4398,7 @@ function renderDashboard(
         </button>
       </section>
 
-      <section className="dashboard-v3-bottom-grid">
+      <section className={`dashboard-v3-bottom-grid ${loading ? "section-fading" : ""}`}>
         <article className="panel dashboard-v3-activity-panel">
           <div className="panel-body dashboard-v3-activity-body">
             <div className="dashboard-v3-side-head">
@@ -3578,6 +4745,7 @@ function renderTickets(
   reimbursementDetails: ReimbursementDetails,
   reimbursementSubmitting: boolean,
   deletingReimbursementRow: number | null,
+  undoingReimbursement: boolean,
   reimbursementStatus: string,
   reimbursementError: string,
   selectedMonth: string,
@@ -3589,11 +4757,13 @@ function renderTickets(
   sortMode: TicketSortMode,
   onMonthChange: (month: string) => void,
   onRefreshTickets: () => void,
+  csvImportBusy: boolean,
   onSearchChange: (value: string) => void,
   onCategoryFilterChange: (value: string) => void,
   onStatusFilterChange: (value: TicketStatusFilter) => void,
   onSortModeChange: (value: TicketSortMode) => void,
   onOpenTicketModal: () => void,
+  onOpenCsvImportModal: () => void,
   onOpenTicketsSheetModal: () => void,
   onCloseTicketsSheetModal: () => void,
   onCloseBudgetDetails: () => void,
@@ -3671,7 +4841,14 @@ function renderTickets(
           </p>
         </div>
         <div className="topbar-actions">
-          {renderMonthFilter(selectedMonth, onMonthChange)}
+          {renderMonthFilter(selectedMonth, onMonthChange, loading)}
+          <button
+            className="ghost-btn"
+            onClick={onOpenCsvImportModal}
+            disabled={csvImportBusy}
+          >
+            {csvImportBusy ? "Analyse CSV..." : "Importer CSV"}
+          </button>
           <button className="ghost-btn refresh-btn" onClick={onRefreshTickets}>
             {isBusy ? "Actualisation..." : "Actualiser"}
           </button>
@@ -3681,7 +4858,7 @@ function renderTickets(
         </div>
       </section>
 
-      <section className="stats-grid tickets-stats-grid">
+      <section className={`stats-grid tickets-stats-grid ${loading ? "section-fading" : ""}`}>
         <article className={`card accent-blue ${showMonthLoading ? "card-loading" : ""}`}>
           <span className="card-label">Solde du compte</span>
           {showMonthLoading ? (
@@ -3733,7 +4910,7 @@ function renderTickets(
         </article>
       </section>
 
-      <section className="content-grid">
+      <section className={`content-grid ${loading ? "section-fading" : ""}`}>
         <article className="panel">
           <div className="panel-head">
             <div>
@@ -3856,10 +5033,32 @@ function renderTickets(
                 if (isEditing) {
                   return (
                     <div
-                      className="ticket-row ticket-row-editing"
+                      className={`ticket-row ticket-row-editing${editTicketSaving ? " ticket-row-saving" : ""}`}
                       key={`${ticket.date}-${ticket.description}-${index}`}
                     >
-                      <div className="ticket-edit-form">
+                      {editTicketSaving ? (
+                        <div className="ticket-saving-overlay">
+                          <div className="card-loader">
+                            <span className="card-loader-ring" />
+                            <span className="card-loader-orbit" />
+                            <span className="card-loader-core" />
+                          </div>
+                          <span className="ticket-saving-label">Modification en cours...</span>
+                        </div>
+                      ) : null}
+
+                      <div className={`ticket-edit-form${editTicketSaving ? " ticket-edit-form-blurred" : ""}`}>
+                        <div className="ticket-edit-header">
+                          <span className="ticket-edit-kicker">Modification du ticket</span>
+                          <span className="ticket-edit-origin">
+                            <span className="ticket-edit-origin-desc">{ticket.description || "Sans description"}</span>
+                            <span className="ticket-edit-origin-sep">·</span>
+                            <span className="ticket-edit-origin-amount">{euro.format(ticket.amount)}</span>
+                            <span className="ticket-edit-origin-sep">·</span>
+                            <span className="ticket-edit-origin-date">{ticket.date}</span>
+                          </span>
+                        </div>
+
                         <div className="ticket-edit-fields">
                           <label className="ticket-edit-field">
                             <span>Description</span>
@@ -3910,13 +5109,15 @@ function renderTickets(
                             </select>
                           </label>
                         </div>
+
                         {editTicketError && <div className="ticket-edit-error">{editTicketError}</div>}
+
                         <div className="ticket-edit-actions">
                           <button className="ghost-btn" onClick={onCancelEditTicket} disabled={editTicketSaving}>
                             Annuler
                           </button>
                           <button className="primary-btn" onClick={onSaveEditTicket} disabled={editTicketSaving}>
-                            {editTicketSaving ? "Sauvegarde..." : "Sauvegarder"}
+                            Sauvegarder
                           </button>
                         </div>
                       </div>
@@ -4049,7 +5250,7 @@ function renderTickets(
 
                       return (
                         <div
-                          className={`reimbursement-active-item ${isDeleting ? "reimbursement-deleting" : ""}`}
+                          className={`reimbursement-active-item ${isDeleting ? "reimbursement-deleting" : ""} ${undoingReimbursement ? "reimbursement-deleting" : ""}`}
                           key={`reimbursement-inline-row-${entry.row}`}
                         >
                           {isDeleting ? (
@@ -4060,6 +5261,15 @@ function renderTickets(
                                 <span className="card-loader-core" />
                               </div>
                               <span className="reimbursement-deleting-label">Suppression...</span>
+                            </div>
+                          ) : undoingReimbursement ? (
+                            <div className="reimbursement-deleting-overlay reimbursement-undoing-overlay">
+                              <div className="card-loader">
+                                <span className="card-loader-ring" />
+                                <span className="card-loader-orbit" />
+                                <span className="card-loader-core" />
+                              </div>
+                              <span className="reimbursement-undoing-label">Restauration...</span>
                             </div>
                           ) : null}
 
@@ -4245,8 +5455,6 @@ function renderTickets(
             </div>
 
             <div className="tickets-sheet-table-shell">
-              {loading ? <div className="status info">Chargement des tickets...</div> : null}
-
               {!loading && error ? renderGoogleSheetsError(error) : null}
 
               {!loading && !error && sheetTickets.length > 0 ? (
@@ -4392,7 +5600,7 @@ function renderAudits(
           </div>
 
           <div className="panel-body">
-            {renderMonthFilter(selectedMonth, onMonthChange)}
+            {renderMonthFilter(selectedMonth, onMonthChange, loading)}
           </div>
         </article>
 
@@ -5934,7 +7142,21 @@ function renderSettings(
       </section>
 
       <section className="content-grid">
-        <article className="panel">
+        <article className={`panel settings-appearance-panel${profileLoading ? " settings-appearance-saving" : ""}`}>
+
+          {profileLoading ? (
+            <div className="settings-appearance-overlay">
+              <div className="card-loader-shell">
+                <div className="card-loader">
+                  <span className="card-loader-ring" />
+                  <span className="card-loader-orbit" />
+                  <span className="card-loader-core" />
+                </div>
+              </div>
+              <span className="settings-appearance-saving-label">Enregistrement...</span>
+            </div>
+          ) : null}
+
           <div className="panel-head">
             <div>
               <span className="panel-kicker">Apparence</span>
@@ -5980,7 +7202,7 @@ function renderSettings(
 
             <div className="ticket-modal-actions">
               <button className="primary-btn" onClick={onSaveQuick} disabled={profileLoading}>
-                {profileLoading ? "Enregistrement..." : "Sauvegarder"}
+                Sauvegarder
               </button>
             </div>
           </div>
@@ -6075,6 +7297,18 @@ function renderSettings(
 }
 
 const patchNotesData: { version: string; date: string; notes: string[] }[] = [
+  {
+    version: "0.1.23",
+    date: "2026-04-23",
+    notes: [
+      "- Import CSV bancaire : nouvelle fonctionnalité d'import des dépenses directement depuis un relevé de compte (en cours de finalisation)",
+      "- Indicateur de chargement animé lors du changement de mois, cohérent avec le thème de l'app",
+      "- Historique des notifications persistant entre les sessions — visible même si l'autre utilisateur n'a pas l'app ouverte ⚠️ *Connu : supprimer une notification, fermer puis rouvrir l'app la fait réapparaître — correctif prévu*",
+      "- Refonte visuelle des blocs Remboursements et Tickets : indicateurs de chargement stylés sur chaque étape (suppression, ajout, retour arrière Ctrl+Z), l'overlay reste affiché jusqu'à ce que les nouvelles données soient bien synchronisées",
+      "- Page Version : alignement homogène de tous les blocs et taille de texte agrandie pour une meilleure lisibilité",
+      "- Paramètres — Apparence : palette de couleurs de profil étendue avec davantage de teintes disponibles, et overlay de chargement animé lors de la sauvegarde du pseudo ou de la couleur",
+    ],
+  },
   {
     version: "0.1.22",
     date: "2026-04-22",
@@ -6398,6 +7632,7 @@ function renderAdminPage(
                 <div className="admin-user-card-actions" style={{ display: "flex", gap: 8 }}>
                   {isFounder && !isSelf && user.role !== "founder" && (
                     <button
+                      type="button"
                       className={user.role === "admin" ? "outline-btn admin-demote-btn" : "primary-btn admin-promote-btn"}
                       onClick={() => onToggleRole(user.email, user.role === "admin" ? "user" : "admin")}
                       disabled={adminLoading}
@@ -6407,6 +7642,7 @@ function renderAdminPage(
                   )}
                   {user.role === "user" && (
                     <button
+                      type="button"
                       className="outline-btn admin-perms-btn"
                       onClick={() => handleOpenPermissions(user)}
                       disabled={adminLoading}
@@ -6796,6 +8032,7 @@ function App() {
   });
   const [historyEvents, setHistoryEvents] = useState<HistoryEvent[]>([]);
   const [historyToasts, setHistoryToasts] = useState<HistoryEvent[]>([]);
+  const [pendingHistoryAction, setPendingHistoryAction] = useState<"undo" | "redo" | null>(null);
   const [historyPanelOpen, setHistoryPanelOpen] = useState(false);
   const [accountSettingsLoading, setAccountSettingsLoading] = useState(false);
   const [accountSettingsStatus, setAccountSettingsStatus] = useState("");
@@ -6854,6 +8091,18 @@ function App() {
   const [submitTicketError, setSubmitTicketError] = useState("");
   const [ticketCategoryPromptOpen, setTicketCategoryPromptOpen] = useState(false);
   const [ticketFollowUpPrompt, setTicketFollowUpPrompt] = useState<TicketFollowUpPrompt | null>(null);
+  const [csvImportModalOpen, setCsvImportModalOpen] = useState(false);
+  const [csvImportDrafts, setCsvImportDrafts] = useState<CsvImportDraft[]>([]);
+  const [csvImportSummary, setCsvImportSummary] = useState<CsvImportSummary>(
+    createEmptyCsvImportSummary
+  );
+  const [csvImportTargetMonth, setCsvImportTargetMonth] = useState(selectedMonth);
+  const [csvImportFileName, setCsvImportFileName] = useState("");
+  const [sharedCsvImportSession, setSharedCsvImportSession] = useState<SharedCsvImportSession | null>(null);
+  const [csvImportLoading, setCsvImportLoading] = useState(false);
+  const [csvImportSubmitting, setCsvImportSubmitting] = useState(false);
+  const [csvImportError, setCsvImportError] = useState("");
+  const [csvImportStatus, setCsvImportStatus] = useState("");
   const [editingTicket, setEditingTicket] = useState<Ticket | null>(null);
   const [editTicketForm, setEditTicketForm] = useState({ date: "", description: "", category: "", amount: "" });
   const [editTicketSaving, setEditTicketSaving] = useState(false);
@@ -6869,6 +8118,7 @@ function App() {
   });
   const [submittingReimbursements, setSubmittingReimbursements] = useState(false);
   const [deletingReimbursementRow, setDeletingReimbursementRow] = useState<number | null>(null);
+  const [undoingReimbursement, setUndoingReimbursement] = useState(false);
   const [reimbursementStatus, setReimbursementStatus] = useState("");
   const [reimbursementError, setReimbursementError] = useState("");
   const [voiceSupported, setVoiceSupported] = useState(false);
@@ -6890,6 +8140,9 @@ function App() {
   const [adminRoleFilter, setAdminRoleFilter] = useState<"all" | "founder" | "admin" | "user">("all");
   const [permissionsModalUser, setPermissionsModalUser] = useState<AccountProfile | null>(null);
   const [permissionsDraft, setPermissionsDraft] = useState<AccountPagePermissions | null>(null);
+  const [permissionsSaving, setPermissionsSaving] = useState(false);
+  const [permissionsError, setPermissionsError] = useState("");
+  const [deniedPageModal, setDeniedPageModal] = useState<PageKey | null>(null);
   const [collabConnectionState, setCollabConnectionState] = useState<
     "connecting" | "live" | "unstable"
   >("connecting");
@@ -6907,6 +8160,8 @@ function App() {
     description: "",
     category: "",
   });
+  const csvImportSharedSubmitting = Boolean(sharedCsvImportSession?.submittingById);
+  const csvImportUiBusy = csvImportLoading || csvImportSubmitting || csvImportSharedSubmitting;
   const newTicketFormRef = useRef(newTicketForm);
   const ticketFollowUpPromptRef = useRef<TicketFollowUpPrompt | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
@@ -6917,12 +8172,17 @@ function App() {
   const pageRef = useRef<PageKey>(getInitialPage());
   const selectedMonthRef = useRef(selectedMonth);
   const ticketsRef = useRef<Ticket[]>([]);
+  const csvImportInputRef = useRef<HTMLInputElement | null>(null);
+  const sharedCsvImportSessionRef = useRef<SharedCsvImportSession | null>(null);
+  const lastCsvImportSessionEventAtRef = useRef(0);
   const lastLoadedMonthRef = useRef("");
   const monthDataCacheRef = useRef<Record<string, MonthDataCacheEntry>>({});
   const lastTicketReloadSeedRef = useRef<number | null>(null);
+  const onReloadDoneRef = useRef<(() => void) | null>(null);
   const lastCompareReloadSeedRef = useRef<number | null>(null);
   const lastAuditReloadSeedRef = useRef<number | null>(null);
   const lastPassiveRefreshAtRef = useRef(0);
+  const historyEventsStorageKeyRef = useRef("");
   const collabNoteTimestampRef = useRef(0);
   const sharedNoteRef = useRef(sharedNote);
   const collabPointerStateRef = useRef<PointerState>({
@@ -7006,6 +8266,10 @@ function App() {
   useEffect(() => {
     ticketsRef.current = tickets;
   }, [tickets]);
+
+  useEffect(() => {
+    sharedCsvImportSessionRef.current = sharedCsvImportSession;
+  }, [sharedCsvImportSession]);
 
   useEffect(() => {
     collabIdentityRef.current = collabIdentity;
@@ -7100,7 +8364,34 @@ function App() {
     lastCompareReloadSeedRef.current = null;
     lastAuditReloadSeedRef.current = null;
     lastPassiveRefreshAtRef.current = 0;
+    sharedCsvImportSessionRef.current = null;
+    setSharedCsvImportSession(null);
   }, [currentAccount]);
+
+  useEffect(() => {
+    if (!currentAccount) {
+      historyEventsStorageKeyRef.current = "";
+      setHistoryEvents([]);
+      setHistoryToasts([]);
+      return;
+    }
+
+    const storageKey = getHistoryEventsStorageKey(currentAccount.email);
+    historyEventsStorageKeyRef.current = storageKey;
+    setHistoryEvents(loadStoredHistoryEvents(currentAccount.email));
+    setHistoryToasts([]);
+  }, [currentAccount?.email]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !historyEventsStorageKeyRef.current) {
+      return;
+    }
+
+    window.localStorage.setItem(
+      historyEventsStorageKeyRef.current,
+      JSON.stringify(historyEvents)
+    );
+  }, [historyEvents]);
 
   useEffect(() => {
     setBudgetPreviewTicket(null);
@@ -7155,10 +8446,10 @@ function App() {
 
   const pushHistoryEvent = (
     event: Omit<HistoryEvent, "id" | "createdAt">,
-    options?: { broadcast?: boolean }
+    options?: { broadcast?: boolean; createdAt?: number; silent?: boolean }
   ) => {
     const shouldBroadcast = options?.broadcast !== false;
-    const now = Date.now();
+    const now = options?.createdAt ?? Date.now();
 
     const fullEvent: HistoryEvent = {
       id: `${now}-${Math.random().toString(36).slice(2, 8)}`,
@@ -7166,8 +8457,10 @@ function App() {
       createdAt: now,
     };
 
-    setHistoryEvents((current) => [fullEvent, ...current].slice(0, 40));
-    setHistoryToasts((current) => [fullEvent, ...current].slice(0, 5));
+    setHistoryEvents((current) => prependHistoryEvent(current, fullEvent));
+    if (!options?.silent) {
+      setHistoryToasts((current) => prependHistoryEvent(current, fullEvent).slice(0, 5));
+    }
 
     if (shouldBroadcast) {
       const historyMessage = {
@@ -7192,6 +8485,32 @@ function App() {
         },
       });
     }
+
+    if (!options?.createdAt) {
+      supabase.from("collab_history_events").insert({
+        id: fullEvent.id,
+        user_id: collabIdentityRef.current.id,
+        user_name: collabIdentityRef.current.name,
+        event_tone: event.tone,
+        event_source: event.source,
+        event_title: event.title,
+        event_detail: event.detail,
+        event_shortcut: event.shortcut ?? null,
+        timestamp: now,
+      }).then(({ error }) => {
+        console.log("insert result:", error ?? "OK");
+      });
+    }
+  };
+
+  const handleDeleteHistoryEvent = (eventId: string) => {
+    setHistoryEvents((current) => current.filter((item) => item.id !== eventId));
+    setHistoryToasts((current) => current.filter((item) => item.id !== eventId));
+  };
+
+  const handleClearHistoryEvents = () => {
+    setHistoryEvents([]);
+    setHistoryToasts([]);
   };
 
   const handleUndo = async () => {
@@ -7199,6 +8518,7 @@ function App() {
 
     if (remoteAction?.kind === "delete") {
       try {
+        setUndoingReimbursement(true);
         setReimbursementStatus("");
         setReimbursementError("");
 
@@ -7234,6 +8554,7 @@ function App() {
           title: "Remboursement restaure",
           detail: `${remoteAction.entry.category} • ${euro.format(remoteAction.entry.amount)} • H${remoteAction.entry.row} / I${remoteAction.entry.row} • ${getSelectedMonthLabel(remoteAction.month)}`,
         });
+        onReloadDoneRef.current = () => { setUndoingReimbursement(false); setPendingHistoryAction(null); };
         setReloadSeed((value) => value + 1);
         return;
       } catch (error) {
@@ -7246,10 +8567,13 @@ function App() {
           title: "Retour arriere refuse",
           detail: message,
         });
+        setUndoingReimbursement(false);
+        setPendingHistoryAction(null);
       }
     }
 
     if (historyState.past.length === 0) {
+      setPendingHistoryAction(null);
       return;
     }
 
@@ -7270,6 +8594,7 @@ function App() {
       title: getLocalHistoryTitle(summary),
       detail: summary,
     });
+    setPendingHistoryAction(null);
   };
 
   const handleRedo = async () => {
@@ -7285,6 +8610,7 @@ function App() {
         setReimbursementError(
           "Impossible de refaire la suppression : remboursement introuvable apres restauration."
         );
+        setPendingHistoryAction(null);
         return;
       }
 
@@ -7319,6 +8645,7 @@ function App() {
           title: "Remboursement supprime",
           detail: `${entryToDelete.category} • ${euro.format(entryToDelete.amount)} • H${entryToDelete.row} / I${entryToDelete.row} • ${getSelectedMonthLabel(remoteAction.month)}`,
         });
+        onReloadDoneRef.current = () => setPendingHistoryAction(null);
         setReloadSeed((value) => value + 1);
         return;
       } catch (error) {
@@ -7331,11 +8658,13 @@ function App() {
           title: "Retour avant refuse",
           detail: message,
         });
+        setPendingHistoryAction(null);
         return;
       }
     }
 
     if (historyState.future.length === 0) {
+      setPendingHistoryAction(null);
       return;
     }
 
@@ -7356,6 +8685,7 @@ function App() {
       title: getLocalHistoryTitle(summary),
       detail: summary,
     });
+    setPendingHistoryAction(null);
   };
 
   const canUndo =
@@ -7378,60 +8708,174 @@ function App() {
 
   const handleOpenPermissions = (user: AccountProfile) => {
     setPermissionsModalUser(user);
-    setPermissionsDraft(getEditablePermissions(user));
+    setPermissionsDraft({ ...getEditablePermissions(user), admin: false });
+    setPermissionsError("");
   };
 
   const handleClosePermissions = () => {
+    if (permissionsSaving) return;
     setPermissionsModalUser(null);
     setPermissionsDraft(null);
+    setPermissionsError("");
   };
 
   const handleTogglePermission = (key: keyof AccountPagePermissions) => {
     if (!permissionsDraft) return;
+    if (key === "admin") return;
     setPermissionsDraft({ ...permissionsDraft, [key]: !permissionsDraft[key] });
   };
 
-  const permissionsModal = permissionsModalUser && permissionsDraft && (
-    <div className="admin-perms-modal-backdrop" onClick={handleClosePermissions}>
-      <div className="admin-perms-modal" onClick={(e) => e.stopPropagation()}>
-        <h2>Autorisation d'accès</h2>
-        <div className="admin-perms-user-summary">
-          <span
-            className="admin-user-avatar-letter"
-            style={{ color: permissionsModalUser.cursorColor }}
-          >
-            {(permissionsModalUser.pseudo || permissionsModalUser.firstName || permissionsModalUser.email)
-              .charAt(0)
-              .toUpperCase()}
-          </span>
-          <div>
-            <strong>{permissionsModalUser.pseudo || permissionsModalUser.email}</strong>
-            <div style={{ fontSize: 13, color: "#888" }}>{permissionsModalUser.email}</div>
-          </div>
-        </div>
-        <div style={{ marginTop: 24 }}>
-          <div className="admin-perms-list">
-            {(Object.keys(permissionsDraft) as (keyof AccountPagePermissions)[]).map((key) => (
-              <button
-                key={key}
-                type="button"
-                className={`admin-perms-row ${permissionsDraft[key] ? "enabled" : "disabled"}`}
-                onClick={() => handleTogglePermission(key)}
-              >
-                <span>{pageLabels[key]}</span>
-                <strong>{permissionsDraft[key] ? "Oui" : "Non"}</strong>
-              </button>
-            ))}
-          </div>
-        </div>
-        <div style={{ marginTop: 20, display: "flex", justifyContent: "flex-end", gap: 10 }}>
-          <button type="button" className="ghost-btn" onClick={handleClosePermissions}>
-            Fermer
-          </button>
-        </div>
-      </div>
-    </div>
-  );
+  const applyPermissionsUpdate = (
+    targetEmail: string,
+    pagePermissions: AccountPagePermissions
+  ) => {
+    const normalizedTargetEmail = normalizeEmail(targetEmail);
+    const normalizedPermissions = normalizePagePermissions(
+      pagePermissions,
+      defaultUserPagePermissions
+    );
+
+    setAdminUsers((current) =>
+      current.map((user) =>
+        user.email === normalizedTargetEmail
+          ? mergeAccountPermissions(user, normalizedPermissions)
+          : user
+      )
+    );
+
+    setPermissionsModalUser((current) =>
+      current?.email === normalizedTargetEmail
+        ? mergeAccountPermissions(current, normalizedPermissions)
+        : current
+    );
+
+    setCurrentAccount((current) => {
+      if (!current || current.email !== normalizedTargetEmail) {
+        return current;
+      }
+
+      const updated = mergeAccountPermissions(current, normalizedPermissions);
+      persistSessionAccount(updated);
+      return updated;
+    });
+  };
+
+  const handleSavePermissions = async () => {
+    if (!currentAccount || !permissionsModalUser || !permissionsDraft) return;
+    if (!isPrivileged(currentAccount)) return;
+
+    const nextPermissions = { ...permissionsDraft, admin: false };
+
+    try {
+      setPermissionsSaving(true);
+      setPermissionsError("");
+
+      const updatedAccount = await updateUserPermissionsInSheets(
+        currentAccount.email,
+        currentAccount.sessionToken,
+        permissionsModalUser.email,
+        nextPermissions
+      );
+
+      applyPermissionsUpdate(updatedAccount.email, updatedAccount.pagePermissions);
+
+      void supabaseChannelRef.current?.send({
+        type: "broadcast",
+        event: "permissions-update",
+        payload: {
+          targetEmail: updatedAccount.email,
+          pagePermissions: updatedAccount.pagePermissions,
+        },
+      });
+
+      collabChannelRef.current?.postMessage({
+        type: "permissions",
+        targetEmail: updatedAccount.email,
+        pagePermissions: updatedAccount.pagePermissions,
+        timestamp: Date.now(),
+      } satisfies CollabMessage);
+
+      pushHistoryEvent({
+        tone: "ok",
+        source: "app",
+        title: "Autorisations mises a jour",
+        detail: `${updatedAccount.email}: acces modules sauvegardes`,
+        shortcut: null,
+      }, { broadcast: false });
+
+      setPermissionsModalUser(null);
+      setPermissionsDraft(null);
+      setPermissionsError("");
+    } catch (error) {
+      setPermissionsError(getErrorMessage(error));
+    } finally {
+      setPermissionsSaving(false);
+    }
+  };
+
+  const permissionsModal =
+    permissionsModalUser && permissionsDraft && typeof document !== "undefined"
+      ? createPortal(
+          <div className="admin-perms-modal-backdrop" onClick={handleClosePermissions}>
+            <div className="admin-perms-modal" onClick={(e) => e.stopPropagation()}>
+              <h2>Autorisation d'accès</h2>
+              <div className="admin-perms-user-summary">
+                <span
+                  className="admin-user-avatar-letter"
+                  style={{ color: permissionsModalUser.cursorColor }}
+                >
+                  {(permissionsModalUser.pseudo || permissionsModalUser.firstName || permissionsModalUser.email)
+                    .charAt(0)
+                    .toUpperCase()}
+                </span>
+                <div>
+                  <strong>{permissionsModalUser.pseudo || permissionsModalUser.email}</strong>
+                  <div style={{ fontSize: 13, color: "#888" }}>{permissionsModalUser.email}</div>
+                </div>
+              </div>
+              <div style={{ marginTop: 24 }}>
+                <div className="admin-perms-list">
+                  {accountPagePermissionKeys.map((key) => {
+                    const isAdminPermission = key === "admin";
+
+                    return (
+                      <button
+                        key={key}
+                        type="button"
+                        className={`admin-perms-row ${permissionsDraft[key] ? "enabled" : "disabled"} ${isAdminPermission ? "locked" : ""}`}
+                        onClick={() => handleTogglePermission(key)}
+                        disabled={permissionsSaving || isAdminPermission}
+                        title={isAdminPermission ? "L admin se donne avec le role admin, pas avec les permissions utilisateur." : undefined}
+                      >
+                        <span>
+                          {pageLabels[key]}
+                          {isAdminPermission ? <small>Role admin requis</small> : null}
+                        </span>
+                        <strong>{isAdminPermission ? "Role" : permissionsDraft[key] ? "Oui" : "Non"}</strong>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+              {permissionsError ? <div className="admin-error admin-perms-error">{permissionsError}</div> : null}
+              <div style={{ marginTop: 20, display: "flex", justifyContent: "flex-end", gap: 10 }}>
+                <button type="button" className="ghost-btn" onClick={handleClosePermissions}>
+                  Fermer
+                </button>
+                <button
+                  type="button"
+                  className="primary-btn"
+                  onClick={handleSavePermissions}
+                  disabled={permissionsSaving}
+                >
+                  {permissionsSaving ? "Enregistrement..." : "Enregistrer"}
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body
+        )
+      : null;
 
    useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -7462,10 +8906,12 @@ function App() {
       event.preventDefault();
 
       if (isUndo) {
+        setPendingHistoryAction("undo");
         handleUndo();
         return;
       }
 
+      setPendingHistoryAction("redo");
       handleRedo();
     };
 
@@ -7629,7 +9075,7 @@ function App() {
       if (message.type === "history") {
         pushHistoryEvent(
           { ...message.event, author: message.user.name },
-          { broadcast: false }
+          { broadcast: false, createdAt: message.timestamp }
         );
         return;
       }
@@ -7640,6 +9086,16 @@ function App() {
           dashboardSubscriptionsStorageKey,
           JSON.stringify(message.subscriptions)
         );
+        return;
+      }
+
+      if (message.type === "permissions") {
+        applyPermissionsUpdate(message.targetEmail, message.pagePermissions);
+        return;
+      }
+
+      if (message.type === "importSession") {
+        applyIncomingSharedCsvImportSession(message.session, message.timestamp);
         return;
       }
 
@@ -7916,7 +9372,7 @@ function App() {
           shortcut: (rawEvent.shortcut as HistoryEvent["shortcut"]) ?? null,
           author: senderName,
         },
-        { broadcast: false }
+        { broadcast: false, createdAt: toNumber(row.timestamp ?? Date.now()) }
       );
     });
 
@@ -7957,14 +9413,61 @@ function App() {
       const targetEmail = String(row.targetEmail ?? "");
       const newRole = String(row.newRole ?? "");
       if (!targetEmail || !newRole) return;
+      const updatedRole = targetEmail === FOUNDER_EMAIL ? "founder" as const : newRole === "admin" ? "admin" as const : "user" as const;
+      const rolePermissions =
+        updatedRole === "admin" || updatedRole === "founder"
+          ? defaultAdminPagePermissions
+          : defaultUserPagePermissions;
+
+      setAdminUsers((current) =>
+        current.map((user) =>
+          user.email === targetEmail
+            ? normalizeAccountProfile({ ...user, role: updatedRole, pagePermissions: rolePermissions }) ?? user
+            : user
+        )
+      );
 
       setCurrentAccount((prev) => {
         if (!prev || prev.email !== targetEmail) return prev;
-        const updatedRole = targetEmail === FOUNDER_EMAIL ? "founder" as const : newRole === "admin" ? "admin" as const : "user" as const;
-        const updated = { ...prev, role: updatedRole };
+        const updated = normalizeAccountProfile({
+          ...prev,
+          role: updatedRole,
+          pagePermissions: rolePermissions,
+        }) ?? prev;
         persistSessionAccount(updated);
         return updated;
       });
+    });
+
+    channel.on("broadcast", { event: "permissions-update" }, ({ payload }) => {
+      if (!payload || typeof payload !== "object") return;
+      const row = payload as Record<string, unknown>;
+      const targetEmail = String(row.targetEmail ?? "");
+      const pagePermissions = normalizePagePermissions(
+        row.pagePermissions ?? row.page_permissions,
+        defaultUserPagePermissions
+      );
+      if (!targetEmail) return;
+
+      applyPermissionsUpdate(targetEmail, pagePermissions);
+    });
+
+    channel.on("broadcast", { event: "import-session" }, ({ payload }) => {
+      if (!payload || typeof payload !== "object") {
+        return;
+      }
+
+      const row = payload as Record<string, unknown>;
+      const senderId = String(row.id ?? "");
+
+      if (!senderId || senderId === collabIdentityRef.current.id) {
+        return;
+      }
+
+      applyIncomingSharedCsvImportSession(
+        normalizeCsvImportSession(row.importSession ?? null),
+        toNumber(row.timestamp ?? Date.now())
+      );
     });
 
     channel.subscribe((status) => {
@@ -7984,6 +9487,32 @@ function App() {
           collabIdentityRef.current.color
         );
         publishPresence("heartbeat");
+
+        // Récupérer les events manqués des dernières 24h
+        const since = Date.now() - 24 * 60 * 60 * 1000;
+        void supabase
+          .from("collab_history_events")
+          .select("*")
+          .gte("timestamp", since)
+          .neq("user_id", collabIdentityRef.current.id)
+          .order("timestamp", { ascending: true })
+          .then(({ data }) => {
+            if (!data || !active) return;
+            data.forEach((row) => {
+              pushHistoryEvent(
+                {
+                  tone: row.event_tone as HistoryEvent["tone"],
+                  source: row.event_source as HistoryEvent["source"],
+                  title: row.event_title,
+                  detail: row.event_detail,
+                  shortcut: (row.event_shortcut as HistoryEvent["shortcut"]) ?? null,
+                  author: row.user_name,
+                },
+                { broadcast: false, createdAt: row.timestamp, silent: true }
+              );
+            });
+          });
+
         return;
       }
 
@@ -8114,6 +9643,11 @@ function App() {
       } finally {
         setLoadingTickets(false);
         setRefreshingTickets(false);
+        const cb = onReloadDoneRef.current;
+        if (cb) {
+          onReloadDoneRef.current = null;
+          cb();
+        }
       }
     };
 
@@ -8338,6 +9872,14 @@ function App() {
   }, [page]);
 
   useEffect(() => {
+    if (!currentAccount || canAccessPage(currentAccount, page)) {
+      return;
+    }
+
+    setPage(getFirstAccessiblePage(currentAccount));
+  }, [currentAccount, page]);
+
+  useEffect(() => {
     if (typeof window === "undefined") {
       return;
     }
@@ -8508,6 +10050,710 @@ function App() {
     setReloadSeed((value) => value + 1);
   };
 
+  const syncCsvImportStateFromSession = (
+    session: SharedCsvImportSession | null,
+    options?: { openModal?: boolean; resetError?: boolean }
+  ) => {
+    setSharedCsvImportSession(session);
+    sharedCsvImportSessionRef.current = session;
+
+    if (!session) {
+      setCsvImportModalOpen(options?.openModal ?? false);
+      setCsvImportDrafts([]);
+      setCsvImportSummary(createEmptyCsvImportSummary());
+      setCsvImportTargetMonth(selectedMonthRef.current);
+      setCsvImportFileName("");
+      setCsvImportStatus("");
+      if (options?.resetError !== false) {
+        setCsvImportError("");
+      }
+      return;
+    }
+
+    setCsvImportDrafts(session.drafts);
+    setCsvImportSummary(session.summary);
+    setCsvImportTargetMonth(session.targetMonth);
+    setCsvImportFileName(session.fileName);
+    setCsvImportStatus(session.status);
+    setCsvImportModalOpen(
+      options?.openModal ??
+        session.participants.some((participant) => participant.id === collabIdentityRef.current.id)
+    );
+
+    if (options?.resetError !== false) {
+      setCsvImportError("");
+    }
+  };
+
+  const broadcastCsvImportSession = (
+    session: SharedCsvImportSession | null,
+    timestamp: number
+  ) => {
+    collabChannelRef.current?.postMessage({
+      type: "importSession",
+      user: collabIdentityRef.current,
+      session,
+      timestamp,
+    } satisfies CollabMessage);
+
+    void supabaseChannelRef.current?.send({
+      type: "broadcast",
+      event: "import-session",
+      payload: {
+        id: collabIdentityRef.current.id,
+        name: collabIdentityRef.current.name,
+        color: collabIdentityRef.current.color,
+        seed: collabIdentityRef.current.seed,
+        importSession: session,
+        timestamp,
+      },
+    });
+  };
+
+  const applySharedCsvImportSession = (
+    session: SharedCsvImportSession | null,
+    options?: { openModal?: boolean; broadcast?: boolean; timestamp?: number; resetError?: boolean }
+  ) => {
+    const eventAt = options?.timestamp ?? session?.updatedAt ?? Date.now();
+    lastCsvImportSessionEventAtRef.current = eventAt;
+    syncCsvImportStateFromSession(session, {
+      openModal: options?.openModal,
+      resetError: options?.resetError,
+    });
+
+    if (options?.broadcast !== false) {
+      broadcastCsvImportSession(session, eventAt);
+    }
+  };
+
+  const updateSharedCsvImportSession = (
+    updater: (current: SharedCsvImportSession | null) => SharedCsvImportSession | null,
+    options?: { openModal?: boolean; broadcast?: boolean; resetError?: boolean }
+  ) => {
+    const current = sharedCsvImportSessionRef.current;
+    const next = updater(current);
+    applySharedCsvImportSession(next, {
+      openModal: options?.openModal,
+      broadcast: options?.broadcast,
+      resetError: options?.resetError,
+      timestamp: next?.updatedAt ?? Date.now(),
+    });
+  };
+
+  const clearCsvImportState = (options?: { preserveSharedSession?: boolean }) => {
+    if (!options?.preserveSharedSession) {
+      setSharedCsvImportSession(null);
+      sharedCsvImportSessionRef.current = null;
+      lastCsvImportSessionEventAtRef.current = Date.now();
+    }
+
+    setCsvImportModalOpen(false);
+    setCsvImportDrafts([]);
+    setCsvImportSummary(createEmptyCsvImportSummary());
+    setCsvImportTargetMonth(selectedMonthRef.current);
+    setCsvImportFileName("");
+    setCsvImportLoading(false);
+    setCsvImportSubmitting(false);
+    setCsvImportError("");
+    setCsvImportStatus("");
+
+    if (csvImportInputRef.current) {
+      csvImportInputRef.current.value = "";
+    }
+  };
+
+  const applyIncomingSharedCsvImportSession = (
+    session: SharedCsvImportSession | null,
+    timestamp: number
+  ) => {
+    if (timestamp < lastCsvImportSessionEventAtRef.current) {
+      return;
+    }
+
+    lastCsvImportSessionEventAtRef.current = timestamp;
+    syncCsvImportStateFromSession(session, {
+      openModal: Boolean(
+        session?.participants.some((participant) => participant.id === collabIdentityRef.current.id)
+      ),
+      resetError: true,
+    });
+
+    if (!session) {
+      setCsvImportLoading(false);
+      setCsvImportSubmitting(false);
+    }
+  };
+
+  const loadExistingTicketsForCsvMonth = async (
+    month: string,
+    options?: { forceRefresh?: boolean }
+  ) => {
+    if (month === selectedMonthRef.current && !options?.forceRefresh) {
+      return ticketsRef.current;
+    }
+
+    const cachedMonth = monthDataCacheRef.current[month];
+
+    if (cachedMonth && !options?.forceRefresh) {
+      return cachedMonth.tickets;
+    }
+
+    const data = await fetchTicketsFromSheets(month);
+    const normalized = normalizeMonthDataPayload(data);
+    const syncedAt = Date.now();
+
+    monthDataCacheRef.current[month] = {
+      tickets: normalized.tickets,
+      summary: normalized.summary,
+      reimbursements: normalized.reimbursements,
+      syncedAt,
+    };
+
+    return normalized.tickets;
+  };
+
+  const handleOpenSharedCsvImportSession = () => {
+    const currentSession = sharedCsvImportSessionRef.current;
+
+    if (!currentSession || csvImportSubmitting) {
+      return;
+    }
+
+    const now = Date.now();
+    const nextSession: SharedCsvImportSession = {
+      ...currentSession,
+      participants: upsertCsvImportParticipant(
+        currentSession.participants,
+        createCsvImportParticipant(collabIdentityRef.current, now)
+      ),
+      updatedAt: now,
+    };
+
+    applySharedCsvImportSession(nextSession, {
+      openModal: true,
+      broadcast: true,
+      resetError: true,
+      timestamp: now,
+    });
+  };
+
+  const handleOpenCsvImportPicker = () => {
+    if (csvImportSubmitting) {
+      return;
+    }
+
+    if (sharedCsvImportSessionRef.current) {
+      handleOpenSharedCsvImportSession();
+      return;
+    }
+
+    if (csvImportInputRef.current) {
+      csvImportInputRef.current.value = "";
+      csvImportInputRef.current.click();
+    }
+  };
+
+  const handleCloseCsvImportModal = () => {
+    if (
+      csvImportSubmitting ||
+      (sharedCsvImportSessionRef.current?.submittingById &&
+        sharedCsvImportSessionRef.current.submittingById !== collabIdentityRef.current.id)
+    ) {
+      return;
+    }
+
+    const currentSession = sharedCsvImportSessionRef.current;
+
+    if (!currentSession) {
+      clearCsvImportState();
+      return;
+    }
+
+    const remainingParticipants = currentSession.participants.filter(
+      (participant) => participant.id !== collabIdentityRef.current.id
+    );
+
+    if (remainingParticipants.length === 0) {
+      applySharedCsvImportSession(null, {
+        openModal: false,
+        broadcast: true,
+        resetError: true,
+        timestamp: Date.now(),
+      });
+      setCsvImportLoading(false);
+      setCsvImportSubmitting(false);
+      return;
+    }
+
+    const nextOwner =
+      currentSession.ownerId === collabIdentityRef.current.id
+        ? remainingParticipants[0]
+        : remainingParticipants.find((participant) => participant.id === currentSession.ownerId) ?? {
+            id: currentSession.ownerId,
+            name: currentSession.ownerName,
+            color: currentSession.ownerColor,
+            lastSeen: currentSession.updatedAt,
+          };
+
+    const now = Date.now();
+    const nextSession: SharedCsvImportSession = {
+      ...currentSession,
+      ownerId: nextOwner.id,
+      ownerName: nextOwner.name,
+      ownerColor: nextOwner.color,
+      participants: remainingParticipants,
+      updatedAt: now,
+      status:
+        currentSession.ownerId === collabIdentityRef.current.id
+          ? `${nextOwner.name} continue l import partage.`
+          : currentSession.status,
+    };
+
+    applySharedCsvImportSession(nextSession, {
+      openModal: false,
+      broadcast: true,
+      resetError: true,
+      timestamp: now,
+    });
+    setCsvImportLoading(false);
+    setCsvImportSubmitting(false);
+  };
+
+  const handleCsvImportFileSelected = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+
+    if (!file) {
+      return;
+    }
+
+    try {
+      setCsvImportLoading(true);
+      setCsvImportError("");
+      setCsvImportStatus("");
+
+      const csvText = await file.text();
+      const accountIdentity = currentAccount
+        ? {
+            firstName: currentAccount.firstName,
+            lastName: currentAccount.lastName,
+            pseudo: currentAccount.pseudo,
+            email: currentAccount.email,
+          }
+        : null;
+
+      const preview = parseRevolutCsvImport(
+        csvText,
+        selectedMonth,
+        [],
+        accountIdentity
+      );
+      const existingTicketsForTargetMonth = await loadExistingTicketsForCsvMonth(preview.targetMonth, {
+        forceRefresh: true,
+      });
+      const parsed = parseRevolutCsvImport(
+        csvText,
+        selectedMonth,
+        existingTicketsForTargetMonth,
+        accountIdentity
+      );
+      const targetMonthLabel = getSelectedMonthLabel(parsed.targetMonth);
+      const currentMonthLabel = getSelectedMonthLabel(selectedMonthRef.current);
+      const now = Date.now();
+      const session: SharedCsvImportSession = {
+        id: createCsvImportDraftId("session"),
+        ownerId: collabIdentityRef.current.id,
+        ownerName: collabIdentityRef.current.name,
+        ownerColor: collabIdentityRef.current.color,
+        submittingById: "",
+        submittingByName: "",
+        fileName: file.name,
+        targetMonth: parsed.targetMonth,
+        summary: parsed.summary,
+        drafts: parsed.drafts,
+        participants: [createCsvImportParticipant(collabIdentityRef.current, now)],
+        status:
+          parsed.drafts.length === 0
+            ? `Aucune nouvelle ligne a importer pour ${targetMonthLabel}.`
+            : parsed.targetMonth === selectedMonthRef.current
+              ? `${parsed.drafts.length} nouvelle(s) ligne(s) detectee(s) pour ${targetMonthLabel}.`
+              : `${parsed.drafts.length} nouvelle(s) ligne(s) detectee(s) pour ${targetMonthLabel}. Vue actuelle: ${currentMonthLabel}.`,
+        startedAt: now,
+        updatedAt: now,
+      };
+
+      applySharedCsvImportSession(session, {
+        openModal: true,
+        broadcast: true,
+        resetError: true,
+        timestamp: now,
+      });
+    } catch (error) {
+      if (sharedCsvImportSessionRef.current) {
+        syncCsvImportStateFromSession(sharedCsvImportSessionRef.current, {
+          openModal: false,
+          resetError: true,
+        });
+        setCsvImportLoading(false);
+        setCsvImportSubmitting(false);
+      } else {
+        clearCsvImportState();
+      }
+      pushHistoryEvent(
+        {
+          tone: "warn",
+          source: "app",
+          title: "Import CSV impossible",
+          detail: getErrorMessage(error),
+          shortcut: null,
+        },
+        { broadcast: false }
+      );
+    } finally {
+      setCsvImportLoading(false);
+    }
+  };
+
+  const handleCsvImportDraftChange = (
+    id: string,
+    patch: Partial<Pick<CsvImportDraft, "date" | "amount" | "description" | "category">>
+  ) => {
+    updateSharedCsvImportSession((current) => {
+      if (!current) {
+        return current;
+      }
+
+      return {
+        ...current,
+        drafts: current.drafts.map((draft) =>
+          draft.id === id
+            ? {
+                ...draft,
+                ...patch,
+                error: "",
+              }
+            : draft
+        ),
+        participants: upsertCsvImportParticipant(
+          current.participants,
+          createCsvImportParticipant(collabIdentityRef.current)
+        ),
+        updatedAt: Date.now(),
+      };
+    }, { openModal: true, broadcast: true, resetError: true });
+    setCsvImportError("");
+  };
+
+  const handleCsvImportDraftIncludeChange = (id: string, include: boolean) => {
+    updateSharedCsvImportSession((current) => {
+      if (!current) {
+        return current;
+      }
+
+      return {
+        ...current,
+        drafts: current.drafts.map((draft) =>
+          draft.id === id
+            ? {
+                ...draft,
+                include,
+                error: "",
+              }
+            : draft
+        ),
+        participants: upsertCsvImportParticipant(
+          current.participants,
+          createCsvImportParticipant(collabIdentityRef.current)
+        ),
+        updatedAt: Date.now(),
+      };
+    }, { openModal: true, broadcast: true, resetError: true });
+    setCsvImportError("");
+  };
+
+  const handleCsvImportSelectAll = (include: boolean) => {
+    updateSharedCsvImportSession((current) => {
+      if (!current) {
+        return current;
+      }
+
+      return {
+        ...current,
+        drafts: current.drafts.map((draft) => ({
+          ...draft,
+          include,
+          error: "",
+        })),
+        participants: upsertCsvImportParticipant(
+          current.participants,
+          createCsvImportParticipant(collabIdentityRef.current)
+        ),
+        updatedAt: Date.now(),
+      };
+    }, { openModal: true, broadcast: true, resetError: true });
+    setCsvImportError("");
+  };
+
+  const handleConfirmCsvImport = async () => {
+    const currentSession = sharedCsvImportSessionRef.current;
+    const activeSubmitterName =
+      currentSession?.submittingById &&
+      currentSession.submittingById !== collabIdentityRef.current.id
+        ? currentSession.submittingByName || currentSession.ownerName
+        : "";
+
+    if (activeSubmitterName) {
+      setCsvImportError(`${activeSubmitterName} importe deja ce lot.`);
+      return;
+    }
+
+    const normalizedDrafts = csvImportDrafts.map((draft) => {
+      if (!draft.include) {
+        return {
+          ...draft,
+          error: "",
+        };
+      }
+
+      const date = draft.date.trim();
+      const description = draft.description.trim();
+      const category = draft.category.trim();
+      const amount = draft.amount.trim();
+      const amountValue = Math.abs(toNumber(amount));
+      let error = "";
+
+      if (!date) {
+        error = "Date requise.";
+      } else if (!description) {
+        error = "Description requise.";
+      } else if (!(amountValue > 0)) {
+        error = "Montant invalide.";
+      } else if (!category) {
+        error = "Categorie requise.";
+      }
+
+      return {
+        ...draft,
+        date,
+        description,
+        category,
+        amount,
+        error,
+      };
+    });
+
+    const draftsToImport = normalizedDrafts.filter((draft) => draft.include);
+
+    if (draftsToImport.length === 0) {
+      updateSharedCsvImportSession(
+        (current) =>
+          current
+            ? {
+                ...current,
+                drafts: normalizedDrafts,
+                participants: upsertCsvImportParticipant(
+                  current.participants,
+                  createCsvImportParticipant(collabIdentityRef.current)
+                ),
+                updatedAt: Date.now(),
+              }
+            : current,
+        { openModal: true, broadcast: true, resetError: false }
+      );
+      setCsvImportError("Aucune ligne n est selectionnee.");
+      return;
+    }
+
+    if (normalizedDrafts.some((draft) => draft.include && draft.error)) {
+      updateSharedCsvImportSession(
+        (current) =>
+          current
+            ? {
+                ...current,
+                drafts: normalizedDrafts,
+                participants: upsertCsvImportParticipant(
+                  current.participants,
+                  createCsvImportParticipant(collabIdentityRef.current)
+                ),
+                updatedAt: Date.now(),
+              }
+            : current,
+        { openModal: true, broadcast: true, resetError: false }
+      );
+      setCsvImportError("Corrige les lignes signalees avant l import.");
+      return;
+    }
+
+    setCsvImportSubmitting(true);
+    setCsvImportError("");
+    setCsvImportStatus("");
+    updateSharedCsvImportSession(
+      (current) =>
+        current
+          ? {
+              ...current,
+              drafts: normalizedDrafts,
+              submittingById: collabIdentityRef.current.id,
+              submittingByName: collabIdentityRef.current.name,
+              participants: upsertCsvImportParticipant(
+                current.participants,
+                createCsvImportParticipant(collabIdentityRef.current)
+              ),
+              status: `${collabIdentityRef.current.name} importe ${draftsToImport.length} ticket(s)...`,
+              updatedAt: Date.now(),
+            }
+          : current,
+      { openModal: true, broadcast: true, resetError: true }
+    );
+
+    const successIds = new Set<string>();
+    const failedById = new Map<string, string>();
+
+    try {
+      for (const draft of draftsToImport) {
+        try {
+          await createTicketInSheets(csvImportTargetMonth, {
+            date: draft.date,
+            amount: formatCsvImportAmount(Math.abs(toNumber(draft.amount))),
+            description: draft.description,
+            category: draft.category,
+          });
+          successIds.add(draft.id);
+        } catch (error) {
+          failedById.set(draft.id, getErrorMessage(error));
+        }
+      }
+
+      const successCount = successIds.size;
+      const failedCount = failedById.size;
+
+      if (successCount > 0) {
+        delete monthDataCacheRef.current[csvImportTargetMonth];
+
+        if (csvImportTargetMonth === selectedMonthRef.current) {
+          setReloadSeed((value) => value + 1);
+        }
+
+        pushHistoryEvent(
+          {
+            tone: failedCount > 0 ? "warn" : "ok",
+            source: "app",
+            title: "Import CSV termine",
+            detail:
+              failedCount > 0
+                ? `${successCount} ticket(s) importe(s) dans ${getSelectedMonthLabel(csvImportTargetMonth)}, ${failedCount} en echec.`
+                : `${successCount} ticket(s) importe(s) dans ${getSelectedMonthLabel(csvImportTargetMonth)} depuis ${csvImportFileName || "le CSV"}.`,
+            shortcut: null,
+          },
+          { broadcast: false }
+        );
+      }
+
+      const remainingDrafts = normalizedDrafts
+        .filter((draft) => !successIds.has(draft.id))
+        .map((draft) => ({
+          ...draft,
+          error: failedById.get(draft.id) ?? "",
+        }));
+
+      if (remainingDrafts.length === 0 && successCount > 0) {
+        applySharedCsvImportSession(null, {
+          openModal: false,
+          broadcast: true,
+          resetError: true,
+          timestamp: Date.now(),
+        });
+        return;
+      }
+
+      if (failedCount > 0) {
+        const nextStatus =
+          successCount > 0
+            ? `${successCount} ticket(s) importe(s) dans ${getSelectedMonthLabel(csvImportTargetMonth)}. ${failedCount} ligne(s) a corriger.`
+            : "Aucun ticket importe.";
+        updateSharedCsvImportSession(
+          (current) =>
+            current
+              ? {
+                  ...current,
+                  drafts: remainingDrafts,
+                  submittingById: "",
+                  submittingByName: "",
+                  participants: upsertCsvImportParticipant(
+                    current.participants,
+                    createCsvImportParticipant(collabIdentityRef.current)
+                  ),
+                  status: nextStatus,
+                  updatedAt: Date.now(),
+                }
+              : current,
+          { openModal: true, broadcast: true, resetError: false }
+        );
+        if (successCount === 0) {
+          setCsvImportError("L import a echoue sur les lignes selectionnees.");
+        }
+        return;
+      }
+
+      if (successCount > 0) {
+        updateSharedCsvImportSession(
+          (current) =>
+            current
+              ? {
+                  ...current,
+                  drafts: remainingDrafts,
+                  submittingById: "",
+                  submittingByName: "",
+                  participants: upsertCsvImportParticipant(
+                    current.participants,
+                    createCsvImportParticipant(collabIdentityRef.current)
+                  ),
+                  status: `${successCount} ticket(s) importe(s) dans ${getSelectedMonthLabel(csvImportTargetMonth)}. ${remainingDrafts.length} ligne(s) restent en revue.`,
+                  updatedAt: Date.now(),
+                }
+              : current,
+          { openModal: true, broadcast: true, resetError: true }
+        );
+      }
+    } catch (error) {
+      setCsvImportError(getErrorMessage(error));
+      updateSharedCsvImportSession(
+        (current) =>
+          current
+            ? {
+                ...current,
+                submittingById: "",
+                submittingByName: "",
+                participants: upsertCsvImportParticipant(
+                  current.participants,
+                  createCsvImportParticipant(collabIdentityRef.current)
+                ),
+                status: "L import CSV a rencontre une erreur.",
+                updatedAt: Date.now(),
+              }
+            : current,
+        { openModal: true, broadcast: true, resetError: false }
+      );
+    } finally {
+      setCsvImportSubmitting(false);
+
+      if (sharedCsvImportSessionRef.current?.submittingById === collabIdentityRef.current.id) {
+        updateSharedCsvImportSession(
+          (current) =>
+            current
+              ? {
+                  ...current,
+                  submittingById: "",
+                  submittingByName: "",
+                  updatedAt: Date.now(),
+                }
+              : current,
+          { openModal: true, broadcast: true, resetError: false }
+        );
+      }
+    }
+  };
+
   const handleAuditReferenceMonthChange = (month: string) => {
     if (month === selectedMonth) {
       return;
@@ -8547,6 +10793,11 @@ function App() {
 
   const changePageWithHistory = (nextPage: PageKey) => {
     if (nextPage === page) {
+      return;
+    }
+
+    if (currentAccount && !canAccessPage(currentAccount, nextPage)) {
+      setDeniedPageModal(nextPage);
       return;
     }
 
@@ -8759,11 +11010,23 @@ function App() {
         throw new Error(responseObject.error || "Modification refusee par Google Sheets.");
       }
 
+      const changes: string[] = [];
+      if (editTicketForm.description !== editingTicket.description)
+        changes.push(`Description : "${editingTicket.description || "—"}" → "${editTicketForm.description}"`);
+      if (editTicketForm.date !== editingTicket.date)
+        changes.push(`Date : ${editingTicket.date || "—"} → ${editTicketForm.date}`);
+      if (Number(editTicketForm.amount) !== editingTicket.amount)
+        changes.push(`Montant : ${euro.format(editingTicket.amount)} → ${euro.format(Number(editTicketForm.amount))}`);
+      if ((editTicketForm.category || "") !== (editingTicket.category || ""))
+        changes.push(`Categorie : ${editingTicket.category || "—"} → ${editTicketForm.category || "—"}`);
+
       pushHistoryEvent({
         tone: "ok",
-        source: "app",
+        source: "sheet",
         title: "Ticket modifie",
-        detail: `"${editTicketForm.description}" — ${Number(editTicketForm.amount).toFixed(2)} €`,
+        detail: changes.length > 0
+          ? changes.join(" • ")
+          : `"${editTicketForm.description}" — ${euro.format(Number(editTicketForm.amount))}`,
         shortcut: null,
       });
 
@@ -8849,10 +11112,10 @@ function App() {
         title: "Remboursement supprime",
         detail: `${entryToDelete.category} • ${euro.format(entryToDelete.amount)} • H${row} / I${row} • ${getSelectedMonthLabel(selectedMonth)}`,
       });
+      onReloadDoneRef.current = () => setDeletingReimbursementRow(null);
       setReloadSeed((value) => value + 1);
     } catch (error) {
       setReimbursementError(getErrorMessage(error));
-    } finally {
       setDeletingReimbursementRow(null);
     }
   };
@@ -9661,7 +11924,9 @@ function App() {
     }
 
     const x = Math.max(0, Math.min(100, ((event.clientX - mainRect.left) / mainRect.width) * 100));
-    const y = Math.max(0, Math.min(100, ((event.clientY - mainRect.top) / mainRect.height) * 100));
+    const scrollH = mainElRef.current?.scrollHeight ?? mainRect.height;
+    const absY = event.clientY - mainRect.top + mainScrollYRef.current;
+    const y = Math.max(0, Math.min(100, (absY / scrollH) * 100));
     const now = Date.now();
 
     if (now - lastPointerSentAtRef.current < 24) {
@@ -9669,7 +11934,7 @@ function App() {
     }
 
     lastPointerSentAtRef.current = now;
-    broadcastPointer(x, y, true, mainScrollYRef.current);
+    broadcastPointer(x, y, true, 0);
   };
 
   const handleGlobalPointerLeave = () => {
@@ -9702,9 +11967,10 @@ function App() {
     );
   }
 
-  const currentMeta = pageMeta[page];
+  const hasCurrentPageAccess = canAccessPage(currentAccount, page);
+  const currentMeta = pageMeta[hasCurrentPageAccess ? page : getFirstAccessiblePage(currentAccount)];
 
-  const menu: { key: PageKey; label: string; badge?: string }[] = [
+  const menuItems: { key: PageKey; label: string; badge?: string }[] = [
     { key: "dashboard", label: "Dashboard" },
     { key: "tickets", label: "Tickets", badge: String(tickets.length) },
     { key: "annual", label: "Envoi annuel" },
@@ -9716,7 +11982,81 @@ function App() {
     { key: "version", label: "Version" },
     { key: "admin" as PageKey, label: "Admin" },
   ];
+  const menu = menuItems;
   const mainViewportRect = mainElRef.current?.getBoundingClientRect() ?? null;
+
+  const deniedAccessModal =
+    deniedPageModal && typeof document !== "undefined"
+      ? createPortal(
+          <div className="modal-backdrop access-denied-backdrop" onClick={() => setDeniedPageModal(null)}>
+            <div className="access-denied-modal" onClick={(event) => event.stopPropagation()}>
+              <div className="access-denied-orb">🔒</div>
+              <span className="panel-kicker">Acces non autorise</span>
+              <h2>{pageMeta[deniedPageModal].title}</h2>
+              <p>
+                Tu vois ce module dans le menu, mais ton compte n a pas encore
+                l autorisation necessaire pour ouvrir cet onglet.
+              </p>
+              <div className="access-denied-hint">
+                Demande a un admin de t activer l acces dans le panneau Admin.
+              </div>
+              <button
+                type="button"
+                className="primary-btn"
+                onClick={() => setDeniedPageModal(null)}
+              >
+                Compris
+              </button>
+            </div>
+          </div>,
+          document.body
+        )
+      : null;
+
+  const renderHistoryEventRow = (eventItem: HistoryEvent) => {
+    const eventDate = new Date(eventItem.createdAt);
+    const dateLabel = eventDate.toLocaleDateString("fr-FR", {
+      day: "2-digit",
+      month: "2-digit",
+      year: "2-digit",
+    });
+    const timeLabel = eventDate.toLocaleTimeString("fr-FR", {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+
+    return (
+      <div key={eventItem.id} className={`history-log-row ${eventItem.tone}`}>
+        <div className="history-log-time">
+          <span>{dateLabel}</span>
+          <strong>{timeLabel}</strong>
+        </div>
+        <div className="history-log-main">
+          <div className="history-log-head">
+            <div className="history-log-title-wrap">
+              {eventItem.author ? (
+                <span className="history-log-author">{eventItem.author}</span>
+              ) : null}
+              {eventItem.shortcut ? (
+                <span className="history-log-shortcut">{eventItem.shortcut}</span>
+              ) : null}
+              <strong>{eventItem.title}</strong>
+            </div>
+            <button
+              type="button"
+              className="history-log-delete"
+              onClick={() => handleDeleteHistoryEvent(eventItem.id)}
+              title="Supprimer cette notification"
+            >
+              Supprimer
+            </button>
+          </div>
+          <p>{eventItem.detail}</p>
+        </div>
+      </div>
+    );
+  };
 
   const historyModal =
     historyPanelOpen && typeof document !== "undefined"
@@ -9734,17 +12074,28 @@ function App() {
                   <span className="eyebrow">Historique</span>
                   <h2>Actions appliquees</h2>
                   <p>
-                    Heure, raccourci, action et resultat. Seulement les vraies actions appliquees.
+                    Date, heure, raccourci, action et resultat. Cet historique reste
+                    ici jusqu a suppression manuelle sur ce compte.
                   </p>
                 </div>
 
-                <button
-                  type="button"
-                  className="modal-close"
-                  onClick={() => setHistoryPanelOpen(false)}
-                >
-                  Fermer
-                </button>
+                <div className="history-modal-actions">
+                  <button
+                    type="button"
+                    className="ghost-btn history-clear-btn"
+                    onClick={handleClearHistoryEvents}
+                    disabled={historyEvents.length === 0}
+                  >
+                    Effacer tout
+                  </button>
+                  <button
+                    type="button"
+                    className="modal-close"
+                    onClick={() => setHistoryPanelOpen(false)}
+                  >
+                    Fermer
+                  </button>
+                </div>
               </div>
 
               <div className="history-log-columns">
@@ -9757,27 +12108,7 @@ function App() {
                         <div className="history-log-section-label history-log-section-sheet">Google Sheets</div>
                         {sheetEvents.length > 0 ? (
                           <div className="history-log-list">
-                            {sheetEvents.map((eventItem) => (
-                              <div key={eventItem.id} className={`history-log-row ${eventItem.tone}`}>
-                                <div className="history-log-time">
-                                  {new Date(eventItem.createdAt).toLocaleTimeString("fr-FR")}
-                                </div>
-                                <div className="history-log-main">
-                                  <div className="history-log-head">
-                                    <div className="history-log-title-wrap">
-                                      {eventItem.author ? (
-                                        <span className="history-log-author">{eventItem.author}</span>
-                                      ) : null}
-                                      {eventItem.shortcut ? (
-                                        <span className="history-log-shortcut">{eventItem.shortcut}</span>
-                                      ) : null}
-                                      <strong>{eventItem.title}</strong>
-                                    </div>
-                                  </div>
-                                  <p>{eventItem.detail}</p>
-                                </div>
-                              </div>
-                            ))}
+                            {sheetEvents.map(renderHistoryEventRow)}
                           </div>
                         ) : (
                           <div className="history-log-empty-col">Aucune action Google Sheets.</div>
@@ -9788,27 +12119,7 @@ function App() {
                         <div className="history-log-section-label history-log-section-app">App</div>
                         {appEvents.length > 0 ? (
                           <div className="history-log-list">
-                            {appEvents.map((eventItem) => (
-                              <div key={eventItem.id} className={`history-log-row ${eventItem.tone}`}>
-                                <div className="history-log-time">
-                                  {new Date(eventItem.createdAt).toLocaleTimeString("fr-FR")}
-                                </div>
-                                <div className="history-log-main">
-                                  <div className="history-log-head">
-                                    <div className="history-log-title-wrap">
-                                      {eventItem.author ? (
-                                        <span className="history-log-author">{eventItem.author}</span>
-                                      ) : null}
-                                      {eventItem.shortcut ? (
-                                        <span className="history-log-shortcut">{eventItem.shortcut}</span>
-                                      ) : null}
-                                      <strong>{eventItem.title}</strong>
-                                    </div>
-                                  </div>
-                                  <p>{eventItem.detail}</p>
-                                </div>
-                              </div>
-                            ))}
+                            {appEvents.map(renderHistoryEventRow)}
                           </div>
                         ) : (
                           <div className="history-log-empty-col">Aucune action locale.</div>
@@ -9847,16 +12158,18 @@ function App() {
             <nav className="nav">
               {menu.map((item) => {
                 const peersOnPage = collaborators.filter((p) => p.page === item.key);
+                const isAllowed = canAccessPage(currentAccount, item.key);
                 return (
                   <button
                     key={item.key}
-                    className={`nav-item ${page === item.key ? "active" : ""}`}
+                    className={`nav-item ${page === item.key ? "active" : ""} ${!isAllowed ? "locked" : ""}`}
                     onClick={() => changePageWithHistory(item.key)}
                   >
                     <span className="nav-item-top">
                       <span>{item.label}</span>
                       {item.badge ? <span className="nav-badge">{item.badge}</span> : null}
                     </span>
+                    {!isAllowed ? <span className="nav-locked-label">Bloque</span> : null}
                     {peersOnPage.length > 0 ? (
                       <span className="nav-peers">
                         {peersOnPage.slice(0, 3).map((peer) => (
@@ -9975,6 +12288,38 @@ function App() {
             >
               Historique
             </button>
+
+            {sharedCsvImportSession ? (
+              <button
+                type="button"
+                className={`ghost-btn history-import-btn ${sharedCsvImportSession.submittingById ? "is-live" : "is-open"}`}
+                onClick={handleOpenSharedCsvImportSession}
+                title="Rejoindre l import CSV partage"
+              >
+                <span
+                  className="history-import-pulse"
+                  style={{
+                    backgroundColor:
+                      sharedCsvImportSession.submittingById
+                        ? sharedCsvImportSession.ownerColor
+                        : sharedCsvImportSession.ownerColor,
+                  }}
+                />
+                <span className="history-import-copy">
+                  <strong>
+                    {sharedCsvImportSession.submittingByName || sharedCsvImportSession.ownerName}
+                  </strong>
+                  <span>
+                    {sharedCsvImportSession.submittingById
+                      ? "importe des tickets"
+                      : "prepare un import CSV"}
+                  </span>
+                </span>
+                <span className="history-import-count">
+                  {sharedCsvImportSession.participants.length}
+                </span>
+              </button>
+            ) : null}
           </div>
         </div>
   
@@ -9984,12 +12329,10 @@ function App() {
               return null;
             }
 
-            const scrollDelta = peer.scrollY - mainScrollY;
+            const scrollH = mainElRef.current?.scrollHeight ?? mainViewportRect.height;
+            const absY = (peer.cursorY / 100) * scrollH;
+            const topPx = mainViewportRect.top + absY - mainScrollY;
             const leftPx = mainViewportRect.left + (peer.cursorX / 100) * mainViewportRect.width;
-            const topPx =
-              mainViewportRect.top +
-              (peer.cursorY / 100) * mainViewportRect.height +
-              scrollDelta;
 
             return (
               <div
@@ -10053,7 +12396,23 @@ function App() {
           </div>
         ) : null}
 
-        {page === "dashboard" &&
+        {!hasCurrentPageAccess ? (
+          <section className="panel admin-blocked-panel">
+            <div className="admin-blocked">
+              <div className="admin-blocked-glow" />
+              <span className="admin-blocked-icon">🔒</span>
+              <h2>Acces bloque</h2>
+              <p className="admin-blocked-desc">
+                Le module <strong>{pageMeta[page].title}</strong> n est pas active pour ce compte.
+              </p>
+              <p className="admin-blocked-hint">
+                Un admin peut modifier cet acces depuis le panneau Admin.
+              </p>
+            </div>
+          </section>
+        ) : null}
+
+        {hasCurrentPageAccess && page === "dashboard" &&
           renderDashboard(
             tickets,
             ticketMonthSummary,
@@ -10070,7 +12429,9 @@ function App() {
             subFormError,
             changeMonthWithHistory,
             handleRefreshTickets,
+            csvImportUiBusy,
             handleOpenTicketModal,
+            handleOpenCsvImportPicker,
             () => { setSubFormError(""); setSubPanelOpen((v) => !v); },
             () => setSubDeletePanelOpen((v) => !v),
             setSubFormLabel,
@@ -10082,7 +12443,7 @@ function App() {
             () => setDashboardUnexpectedModalOpen(true),
             () => setDashboardUnexpectedModalOpen(false)
           )}
-        {page === "tickets" &&
+        {hasCurrentPageAccess && page === "tickets" &&
           renderTickets(
             visibleTickets,
             tickets,
@@ -10098,6 +12459,7 @@ function App() {
             reimbursementDetails,
             submittingReimbursements,
             deletingReimbursementRow,
+            undoingReimbursement,
             reimbursementStatus,
             reimbursementError,
             selectedMonth,
@@ -10110,11 +12472,13 @@ function App() {
             ticketSortMode,
             changeMonthWithHistory,
             handleRefreshTickets,
+            csvImportUiBusy,
             handleTicketSearchChange,
             handleTicketCategoryFilterChange,
             handleTicketStatusFilterChange,
             handleTicketSortModeChange,
             handleOpenTicketModal,
+            handleOpenCsvImportPicker,
             () => setTicketsSheetModalOpen(true),
             () => setTicketsSheetModalOpen(false),
             () => setBudgetDetailsOpen(false),
@@ -10132,7 +12496,7 @@ function App() {
             (patch: Partial<{ date: string; description: string; category: string; amount: string }>) => setEditTicketForm((prev) => ({ ...prev, ...patch })),
             handleSaveEditTicket
           )}
-        {page === "audits" &&
+        {hasCurrentPageAccess && page === "audits" &&
           renderAudits(
             tickets,
             ticketMonthSummary,
@@ -10148,7 +12512,7 @@ function App() {
             handleAuditReferenceMonthChange,
             handleRefreshAudits
           )}
-        {page === "compare" &&
+        {hasCurrentPageAccess && page === "compare" &&
           renderCompare(
             comparePrimaryMonth,
             compareSecondaryMonth,
@@ -10164,7 +12528,7 @@ function App() {
             handleRefreshCompare,
             setCompareSortMode
           )}
-        {page === "collab" &&
+        {hasCurrentPageAccess && page === "collab" &&
           renderCollab(
             collabIdentity,
             collaborators,
@@ -10184,7 +12548,7 @@ function App() {
             handleClearSharedNote,
             setFollowedPeerId
           )}
-        {page === "settings" &&
+        {hasCurrentPageAccess && page === "settings" &&
           renderSettings(
             currentAccount,
             accountSettingsForm,
@@ -10200,7 +12564,7 @@ function App() {
             handleSaveAccountSettings,
             handleLogout
           )}
-        {page === "version" &&
+        {hasCurrentPageAccess && page === "version" &&
           renderVersionPage(
             updaterStatus,
             availableUpdate,
@@ -10213,7 +12577,7 @@ function App() {
             handleCheckUpdates,
             handleInstallUpdate
           )}
-        {page === "admin" &&
+        {hasCurrentPageAccess && page === "admin" &&
           renderAdminPage(
             currentAccount,
             adminUsers,
@@ -10228,11 +12592,43 @@ function App() {
             adminRoleFilter,
             setAdminRoleFilter
           )}
-        {!["dashboard", "tickets", "audits", "compare", "collab", "settings", "version", "admin"].includes(page) && renderPlaceholder(page)}
+        {hasCurrentPageAccess && !["dashboard", "tickets", "audits", "compare", "collab", "settings", "version", "admin"].includes(page) && renderPlaceholder(page)}
 
       </main>
+      <input
+        ref={csvImportInputRef}
+        type="file"
+        accept=".csv,text/csv"
+        style={{ display: "none" }}
+        onChange={handleCsvImportFileSelected}
+      />
       {historyModal}
       {permissionsModal}
+      {deniedAccessModal}
+
+      {pendingHistoryAction ? (
+        <div className="history-toast-stack">
+          <div className="history-toast history-toast-info history-toast-pending">
+            <div className="history-toast-pending-loader">
+              <div className="card-loader">
+                <span className="card-loader-ring" />
+                <span className="card-loader-orbit" />
+                <span className="card-loader-core" />
+              </div>
+            </div>
+            <div className="history-toast-content">
+              <div className="history-toast-head">
+                <span className="history-toast-shortcut">
+                  {pendingHistoryAction === "undo" ? "Ctrl+Z" : "Ctrl+Y"}
+                </span>
+                <strong>
+                  {pendingHistoryAction === "undo" ? "Retour en arrière..." : "Refaire..."}
+                </strong>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {historyToasts.length > 0 ? (
         <div className="history-toast-stack">
@@ -10282,6 +12678,25 @@ function App() {
           handleNewTicketFormChange,
           handleToggleVoice
         )}
+      {renderCsvImportModal(
+        csvImportModalOpen,
+        csvImportFileName,
+        csvImportTargetMonth,
+        selectedMonth,
+        csvImportSummary,
+        csvImportDrafts,
+        sharedCsvImportSession,
+        csvImportLoading || csvImportSharedSubmitting,
+        csvImportSubmitting,
+        csvImportError,
+        csvImportStatus,
+        handleCloseCsvImportModal,
+        handleOpenCsvImportPicker,
+        handleCsvImportSelectAll,
+        handleCsvImportDraftIncludeChange,
+        handleCsvImportDraftChange,
+        handleConfirmCsvImport
+      )}
     </div>
   );
 }

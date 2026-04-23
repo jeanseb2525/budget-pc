@@ -101,8 +101,8 @@ Secrets :
 5. Quand tu veux sortir une version, cree un tag :
 
 ```powershell
-git tag v0.1.20
-git push origin v0.1.20
+git tag v0.1.23
+git push origin v0.1.23
 ```
 
 6. GitHub Actions fera la release automatiquement.
@@ -111,6 +111,14 @@ git push origin v0.1.20
 
 
 ## Patch notes précédentes
+
+### v0.1.23 (23/04/2026)
+- Import CSV bancaire : nouvelle fonctionnalité d'import des dépenses directement depuis un relevé de compte (en cours de finalisation)
+- Indicateur de chargement animé lors du changement de mois, cohérent avec le thème de l'app
+- Historique des notifications persistant entre les sessions — visible même si l'autre utilisateur n'a pas l'app ouverte ⚠️ *Connu : supprimer une notification, fermer puis rouvrir l'app la fait réapparaître — correctif prévu*
+- Refonte visuelle des blocs Remboursements et Tickets : indicateurs de chargement stylés sur chaque étape (suppression, ajout, retour arrière Ctrl+Z), l'overlay reste affiché jusqu'à ce que les nouvelles données soient bien synchronisées
+- Page Version : alignement homogène de tous les blocs et taille de texte agrandie pour une meilleure lisibilité
+- Paramètres — Apparence : palette de couleurs de profil étendue avec davantage de teintes disponibles, et overlay de chargement animé lors de la sauvegarde du pseudo ou de la couleur
 
 ### v0.1.22 (22/04/2026)
 - Refonte de l'affichage de synchronisation (temps réel depuis la dernière actualisation)
@@ -129,7 +137,7 @@ git push origin v0.1.20
 - Ajout de la création de ticket (fonctionnelle mais à améliorer)
 - Divers correctifs et ajustements visuels
 
-### v0.1.20 (14/044/2026)
+### v0.1.20 (14/04/2026)
 - Ajout du panel Admin (acces restreint aux admins)
 - Liste des comptes avec email, prenom, nom, pseudo, couleur et role
 - Promotion / retrait du role admin pour les co-gerants
